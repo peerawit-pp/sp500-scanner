@@ -102,7 +102,8 @@ def _lookback_low(o, h, l, c, i, lookback):
     t_low_body = _pmax(o[i], c[i])
     x_body = _pmax(at(o, i - 1), at(c, i - 1))
     x_bar = i - 1
-    for j in range(1, lookback + 1):
+    js = range(1, lookback + 1) if lookback >= 1 else (1, 0)     # Pine: for i = 1 to 0 วนถอยหลัง (1, 0)
+    for j in js:
         lj = at(l, i - j)
         if lj < t_low:
             t_low, t_low_bar = lj, i - j

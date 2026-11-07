@@ -1,11 +1,12 @@
-# US Stock Scanner — Higher Low ✅ + Price vs X ✅ (4H / D / W) + MTF EMA89 4H
+# US Stock Scanner — หัว Fibo ขาขึ้น / ขาลง (4H / 1H) + MTF EMA89 4H
 
 เว็บแอปสแกนหุ้น US (ฟรี) จาก **S&P 500 / NASDAQ 100 / Dow Jones 30 / NASDAQ Composite** กรอง Market cap ได้เอง (ค่าเริ่มต้น ≥ 10B) แล้วคัดตัวที่เข้าเงื่อนไขจาก Pine ของคุณ
 
 ## ไฟล์
 | ไฟล์ | แปลงจาก Pine | หน้าที่ |
 |---|---|---|
-| `logic.py` | Reversal Candle [Stoch Oversold] — `f_lookbackLow`, `f_htfTrigger`/`f_ltfSwLow`, alert | Higher Low + Price vs X |
+| `heads.py` | Reversal Candle [Stoch Oversold] — `f_lookbackLow/High`, `f_htfTriggerLowM`, `f_htfTriggerHigh`, `f_headLatchLow`, `f_headLatchHigh` | **หัว Fibo ขาขึ้น / ขาลง (Auto)** บน 4H / 1H |
+| `logic.py` | Reversal Candle [Stoch Oversold] — `f_htfTrigger` (Higher Low) | ใช้ร่วม: Stochastic, EMA, รวมแท่ง 4H |
 | `fibo.py` | Fibo New ver7 + EMA89 MTF — `f_htfTrigger` (ver7), Sticky Fallback, Weekly OB, EMA conf/live | EMA89 MTF + Fibo Support |
 | `app.py` | — | หน้าเว็บ: สแกน / ตรวจสอบรายตัว / เทียบกับ TradingView |
 | `scanner.py` | — | แกนการสแกน ใช้ร่วมกันระหว่างแอปและสแกนอัตโนมัติ (ผลตรงกัน) |
@@ -82,7 +83,7 @@ repo → **Add file → Create new file** → ช่องชื่อพิม�
 |---|---|
 | เปิดผลสแกนอัตโนมัติ | ไม่กี่วินาที |
 | เปลี่ยนเงื่อนไขกรองหลังสแกน (ทั้ง 2 โหมด) | ทันที ไม่ต้องสแกนใหม่ |
-| สแกนสดครั้งแรกหลังแอปรีสตาร์ท/หลับ | ~3 นาที (ติดลิมิต Alpaca ฟรี 200 คำขอ/นาที) — โหลดทีละ 100 ตัว ถ้าหยุดกลางทางกดใหม่จะทำต่อ |
+| สแกนสดครั้งแรกหลังแอปรีสตาร์ท/หลับ | ~2 นาที (ใช้แค่ข้อมูล 1H แล้ว ไม่ต้องดึง D/W) (ติดลิมิต Alpaca ฟรี 200 คำขอ/นาที) — โหลดทีละ 100 ตัว ถ้าหยุดกลางทางกดใหม่จะทำต่อ |
 | สแกนสดซ้ำภายใน 15 นาที | ~15 วินาที (ใช้ cache) |
 | สแกนสดซ้ำหลัง 15 นาที (ภายใน 3 วัน) | ~20–40 วินาที (ดึงเฉพาะแท่งใหม่) |
 
@@ -98,22 +99,29 @@ repo → **Add file → Create new file** → ช่องชื่อพิม�
 - Market cap มาจากรายชื่อหุ้นของ Nasdaq (อัปเดตรายวัน) ไม่ได้มาจาก Alpaca
 - หลังสแกน แอปแจ้งว่าโหลดได้กี่ตัว ถ้าขาดจะมีรายชื่อในกล่อง "⚠️ ข้อมูลไม่ครบ"
 
-## เงื่อนไขการคัดกรอง (ทำงานตามลำดับ)
-0. **ดัชนี** เลือกได้หลายตัว (ค่าเริ่มต้นเลือกทั้ง 4) — รวมรายชื่อแบบไม่ซ้ำ ตารางผลมีคอลัมน์ Index บอกว่าหุ้นอยู่ดัชนีไหน
-   - S&P 500: ดึงจาก GitHub (datasets/s-and-p-500-companies)
-   - NASDAQ Composite + market cap + sector: ดึงจาก GitHub (rreichel3/US-Stock-Symbols ข้อมูลจาก Nasdaq อัปเดตรายวัน)
-   - NASDAQ 100 / Dow 30: จาก `indices.csv` (อัปเดต พ.ย. 2026)
-   - ทั้ง 4 ดัชนีที่ ≥ 10B ≈ 617 ตัว → สแกนครั้งแรกด้วย Alpaca ประมาณ 3 นาที
-1. **Market cap** ขั้นต่ำ–สูงสุด (พันล้าน USD) ค่าเริ่มต้น ≥ 10B
-2. **MTF EMA89 4H** — ราคาต้อง `>` EMA89 ของ 4H (เหมือนคอลัมน์ EMA89 ใน Dashboard)
-   - "ใช้แท่ง 4H ที่ปิดแล้ว" = `ta.ema()[1]` + `lookahead_on` (No Repaint)
-3. **Higher Low / Price vs X** รันพร้อมกันบน **4H / D / W** แสดง ✅ / ❌ / — แบบ Dashboard บน TradingView
-   - เลือกได้: "Higher Low ✅ + Price vs X ✅" หรือ "Higher Low ✅ อย่างเดียว"
-     ใน "อย่างน้อย 1 TF" หรือ "ทุก TF ที่เลือก" และกรองเฉพาะ Alert ที่เพิ่งเกิดภายใน N แท่งได้
-4. **Fibo Support** (ไม่บังคับ, ปิดไว้เป็นค่าเริ่มต้น)
+## หน้าสแกน
+คอลัมน์: Symbol · Name · Index · Sector · MktCap (B) · Price · EMA89 4H · % จาก EMA89 4H ·
+หัว Fibo ขาขึ้น 4H · หัว Fibo ขาขึ้น 1H · หัว Fibo ขาลง 4H · หัว Fibo ขาลง 1H (✅ = มีหัว, - = ไม่มี) · Chart
+- Index ย่อ: SPX = S&P 500 · NDX = NASDAQ 100 · DJI = Dow Jones 30 · IXIC = NASDAQ Composite
+- แยก 2 ตาราง: 🟢 ไม่มีหัว Fibo ขาลง / 🔴 มีหัว Fibo ขาลง (4H หรือ 1H) — เลือกซ่อนหรือรวมเป็นตารางเดียวได้
+- สวิตช์ "แสดงราคาหัว Fibo" → แสดง ✅ พร้อมราคาหัว
+
+## เงื่อนไขการคัดกรอง
+1. **ดัชนี** S&P 500 / NASDAQ 100 / Dow 30 / NASDAQ Composite (เลือกได้หลายตัว)
+2. **Market cap** ค่าเริ่มต้น ≥ 10B
+3. **MTF EMA89 4H** — ราคาต้อง `>` EMA89 ของ 4H (แท่ง 4H ที่ปิดแล้ว = `ta.ema()[1]` + `lookahead_on`)
+4. **หัว Fibo ขาขึ้น** (ไม่บังคับ) — ต้องมีใน 4H / 1H อย่างน้อย 1 TF หรือทุก TF ที่เลือก
+
+## ลอจิกหัว Fibo (ตรงกับ Combined Mode ใน Pine)
+- 📈 ขาขึ้น: `f_htfTriggerLowM` (เก็บ Low จริงตลอด cycle แล้วย้อนแก้ SW Low ตอน %K เข้า OB) → `f_headLatchLow`
+  latch เมื่อเข้า OS + SW Low เป็น Higher Low + ปิดเหนือ X · low ทะลุหัว → ถอยไปหัวเดิม (ถ้าหัวเดิมเป็น Higher Low) · ทะลุหัวเดิม / Lower Low → "-"
+- 📉 ขาลง: `f_htfTriggerHigh` → `f_headLatchHigh` (กลับด้านทั้งหมด)
+- คำนวณบนแท่ง 4H / 1H ของ TF นั้นเอง เหมือน `request.security(..., "240"/"60")`
+- ตรวจสอบแล้ว: engine ขาขึ้นกับขาลงเขียนแยกกัน แต่ให้ผลกลับด้านตรงกันทุกแท่ง (mirror test 120 ชุด) ตามที่ Pine ระบุว่า mirror 100%
+- ใช้ค่า input เดียวกับ Pine (แก้ได้ใน expander Stochastic): %K 9, Smooth 3, OS 20, OB 80, Max Scan 80, Trail 5, Lookback 3
 
 ## ความต่างจาก TradingView ที่ยังเหลือ
 - ราคาจาก Alpaca / Yahoo อาจต่างจาก feed ของ TradingView ระดับเซนต์ → หุ้นที่ราคาชิด X หรือ SW Low สองตัวใกล้กันมาก ติ๊กอาจพลิกได้
 - ประวัติข้อมูลสั้นกว่าบน TradingView → state machine เริ่มคนละจุด แต่ลู่เข้าหากันหลัง cycle reset ที่ OB
-- Price vs X ใช้ราคาปิดของแท่ง TF นั้นเอง (บน TradingView ถ้าเปิดกราฟ 4H จะเทียบ X ของ D/W กับราคาปิด 4H)
+- ใช้แท่งที่ปิดแล้ว: ระหว่างแท่ง 4H / 1H ยังไม่ปิด บน TradingView (real-time) ค่าหัวอาจขยับก่อนแอป
 - EMA ใช้ source = close

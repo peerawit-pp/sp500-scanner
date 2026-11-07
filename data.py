@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import pandas as pd
@@ -164,20 +164,37 @@ class AlpacaError(Exception):
 
 
 class _RateLimiter:
-    """จำกัดจำนวนคำขอต่อนาที (แผนฟรี 200/นาที — ใช้ 190 เผื่อไว้)"""
+    """จำกัดจำนวนคำขอต่อนาที (แผนฟรี 200/นาที — ใช้ 190 เผื่อไว้) + หยุดรอทั้งหมดเมื่อ Alpaca บอกว่าโควตาใกล้หมด"""
 
     def __init__(self, per_min: int = 190):
         self.gap = 60.0 / per_min
         self.lock = threading.Lock()
         self.next_t = 0.0
+        self.pause_until = 0.0
 
     def wait(self):
         with self.lock:
             now = time.monotonic()
-            t = max(now, self.next_t)
+            t = max(now, self.next_t, self.pause_until)
             self.next_t = t + self.gap
         if t > now:
             time.sleep(t - now)
+
+    def pause(self, seconds: float):
+        with self.lock:
+            self.pause_until = max(self.pause_until, time.monotonic() + seconds)
+
+
+def new_stats() -> dict:
+    return {"req": 0, "r429": 0, "timeouts": 0, "errors": 0, "sec": 0.0, "wait429": 0.0}
+
+
+def _reset_wait(r) -> float | None:
+    """วินาทีจนโควตารีเซ็ต จาก header X-RateLimit-Reset (epoch)"""
+    try:
+        return max(0.0, float(r.headers.get("X-RateLimit-Reset")) - time.time()) + 0.5
+    except (TypeError, ValueError):
+        return None
 
 
 def _page_to_df(bars: list, session_only: bool) -> pd.DataFrame:
@@ -192,7 +209,7 @@ def _page_to_df(bars: list, session_only: bool) -> pd.DataFrame:
     return df
 
 
-def _alpaca_fetch_group(syms, timeframe, start, end, limiter, headers, feed, session_only, finish):
+def _alpaca_fetch_group(syms, timeframe, start, end, limiter, headers, feed, session_only, finish, stats):
     """ดึงหลาย symbol ในคำขอเดียว + ไล่ next_page_token จนครบ แล้วย่อข้อมูลทันที"""
     sess = requests.Session()           # 1 session ต่อ thread
     acc: dict[str, list] = {}
@@ -202,25 +219,43 @@ def _alpaca_fetch_group(syms, timeframe, start, end, limiter, headers, feed, ses
                   "limit": 10000, "adjustment": "split", "feed": feed, "sort": "asc"}
         if token:
             params["page_token"] = token
-        for attempt in range(6):
+        fails, last_err = 0, ""
+        while True:
             limiter.wait()
+            t0 = time.time()
             try:
-                r = sess.get(ALPACA_BARS_URL, params=params, headers=headers, timeout=30)
-            except requests.RequestException:
-                time.sleep(2 * (attempt + 1))
-                continue
-            if r.status_code == 429:
-                time.sleep(float(r.headers.get("Retry-After", 3 * (attempt + 1))))
-                continue
-            if r.status_code in (401, 403):
-                raise AlpacaError(f"Alpaca ปฏิเสธคำขอ ({r.status_code}): {r.text[:200]}")
-            if r.status_code >= 500:
-                time.sleep(2 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            break
-        else:
-            raise AlpacaError("Alpaca ไม่ตอบหลังลองซ้ำหลายครั้ง")
+                r = sess.get(ALPACA_BARS_URL, params=params, headers=headers, timeout=(10, 60))
+            except requests.Timeout:
+                stats["timeouts"] += 1
+                fails, last_err = fails + 1, "หมดเวลารอ (timeout)"
+            except requests.RequestException as e:
+                stats["errors"] += 1
+                fails, last_err = fails + 1, f"เชื่อมต่อไม่ได้ ({type(e).__name__})"
+            else:
+                stats["req"] += 1
+                stats["sec"] += time.time() - t0
+                rem = r.headers.get("X-RateLimit-Remaining")
+                if rem is not None and str(rem).isdigit() and int(rem) <= 3:
+                    limiter.pause(_reset_wait(r) or 5)          # โควตาใกล้หมด -> พักทุก thread
+                if r.status_code == 429:                       # โดนจำกัด: รอจนโควตารีเซ็ต (ไม่นับเป็นความล้มเหลว)
+                    w = _reset_wait(r) or 15.0
+                    stats["r429"] += 1
+                    stats["wait429"] += w
+                    if stats["wait429"] > 900:
+                        raise AlpacaError("Alpaca จำกัดจำนวนคำขอ (429) ต่อเนื่องนานเกินไป — อาจมีการสแกนอื่นใช้ "
+                                          "API Key เดียวกันอยู่ (เช่น GitHub Actions) รอให้เสร็จก่อนแล้วลองใหม่")
+                    limiter.pause(w)
+                    continue
+                if r.status_code in (401, 403):
+                    raise AlpacaError(f"Alpaca ปฏิเสธคำขอ ({r.status_code}): {r.text[:200]}")
+                if r.status_code < 500:
+                    r.raise_for_status()
+                    break
+                stats["errors"] += 1
+                fails, last_err = fails + 1, f"เซิร์ฟเวอร์ Alpaca ขัดข้อง (HTTP {r.status_code})"
+            if fails >= 6:
+                raise AlpacaError(f"Alpaca ไม่ตอบหลังลองซ้ำ 6 ครั้ง — สาเหตุล่าสุด: {last_err}")
+            time.sleep(min(30, 2 ** fails))
         js = r.json()
         for s, bars in (js.get("bars") or {}).items():
             if bars:
@@ -241,24 +276,33 @@ def _alpaca_fetch_group(syms, timeframe, start, end, limiter, headers, feed, ses
 
 
 def alpaca_bars(symbols: list[str], timeframe: str, start: pd.Timestamp, key: str, secret: str,
-                feed: str = "sip", group: int = 20, workers: int = 6,
+                feed: str = "sip", group: int = 20, workers: int = 4,
                 session_only: bool = False, finish=None, progress=None) -> dict[str, pd.DataFrame]:
     """คืน dict[alpaca_symbol -> DataFrame] index เป็นเวลา NY
-    progress(done, total) ถูกเรียกจาก thread หลักทุกครั้งที่ดึงเสร็จ 1 กลุ่ม"""
+    progress(done, total, stats=...) ถูกเรียกจาก thread หลักทุก ~1 วินาที"""
     headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
     # แผนฟรี: ข้อมูล SIP ต้องมี end เก่ากว่า 15 นาที
     end = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
     start_s = start.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
-    limiter = _RateLimiter()
+    limiter, stats = _RateLimiter(), new_stats()
     groups = [symbols[i:i + group] for i in range(0, len(symbols), group)]
     out: dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_alpaca_fetch_group, g, timeframe, start_s, end, limiter, headers, feed,
-                          session_only, finish) for g in groups]
-        for done, f in enumerate(as_completed(futs), 1):
-            out.update(f.result())
+        pending = {ex.submit(_alpaca_fetch_group, g, timeframe, start_s, end, limiter, headers, feed,
+                             session_only, finish, stats) for g in groups}
+        done_n = 0
+        while pending:
+            finished, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            for f in finished:
+                try:
+                    out.update(f.result())
+                except Exception:
+                    for p_ in pending:
+                        p_.cancel()
+                    raise
+                done_n += 1
             if progress:
-                progress(done, len(groups))
+                progress(done_n, len(groups), stats=stats)
     return out
 
 

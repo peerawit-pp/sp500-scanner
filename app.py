@@ -1,8 +1,10 @@
 """
-US Stock Multi-TF Scanner (S&P 500 / NASDAQ 100 / Dow 30 / NASDAQ Composite) — Higher Low + Price > X บน 4H / D / W  +  MTF EMA89 4H
-ลอจิกแปลงจาก Pine:
-  - "Reversal Candle [Stoch Oversold]"                      -> logic.py  (Higher Low + Price > X)
-  - "Reversal Candle [Stoch Oversold] Fibo New ver7 + EMA89" -> fibo.py   (EMA89 MTF + Fibo Support)
+US Stock Scanner (S&P 500 / NASDAQ 100 / Dow 30 / NASDAQ Composite)
+  หัว Fibo ขาขึ้น / ขาลง (Auto) บน 4H / 1H  +  MTF EMA89 4H
+ลอจิกแปลงจาก Pine "Reversal Candle [Stoch Oversold]":
+  - f_htfTriggerLowM + f_headLatchLow   -> heads.py  (หัว Fibo ขาขึ้น)
+  - f_htfTriggerHigh + f_headLatchHigh  -> heads.py  (หัว Fibo ขาลง)
+  - MTF EMA89 4H (ema[1] + lookahead_on) -> fibo.mtf_ema
 รัน:  streamlit run app.py
 """
 import time
@@ -15,17 +17,18 @@ import streamlit as st
 
 import data
 import scanner
-from fibo import FIB_LEVELS, drop_unclosed, fibo_levels, last_bar_closed, mtf_ema
-from logic import Params, ema, hl_engine, resample_4h, tf_state
+from fibo import mtf_ema
+from heads import HeadParams, head_latch_high, head_latch_low, trigger_high, trigger_low_m
+from logic import ema
 
-st.set_page_config(page_title="US Stock Multi-TF Scanner", page_icon="📈", layout="wide")
-st.title("📈 US Stock Scanner — Higher Low (4H / D / W) + EMA89 4H")
-st.caption("ลอจิกจาก Reversal Candle [Stoch Oversold] + MTF EMA89 4H · ราคาจาก Alpaca (SIP ดีเลย์ 15 นาที) "
-           "หรือ Yahoo Finance · ใช้ประกอบการตัดสินใจเท่านั้น ยืนยันกราฟบน TradingView ก่อนเข้า order")
+st.set_page_config(page_title="US Stock Fibo Head Scanner", page_icon="📈", layout="wide")
+st.title("📈 US Stock Scanner — หัว Fibo ขาขึ้น / ขาลง (4H / 1H) + EMA89 4H")
+st.caption("ลอจิกจาก Reversal Candle [Stoch Oversold] (Combined Mode: หัว Fibo Auto) + MTF EMA89 4H · "
+           "ราคาจาก Alpaca (SIP ดีเลย์ 15 นาที) หรือ Yahoo Finance · ใช้ประกอบการตัดสินใจเท่านั้น "
+           "ยืนยันกราฟบน TradingView ก่อนเข้า order")
 
 TFS = scanner.TFS
-SRC = {"1h": "730d", "1d": "10y", "1wk": "10y", "1mo": "max"}
-FIBO_TF = {"Daily": "D", "Weekly": "W", "Weekly (OB)": "W", "Monthly": "M"}
+SRC = {"1h": "730d"}
 ALPACA, YAHOO = "Alpaca (แนะนำ)", "Yahoo Finance"
 NAN = float("nan")
 
@@ -54,6 +57,12 @@ PRICE_TTL = 15 * 60
 @st.cache_resource
 def _price_cache() -> dict:
     """cache ราคา Alpaca ร่วมกันทุก session: {(interval, tickers, key_id): (เวลา, data)}"""
+    return {}
+
+
+@st.cache_resource
+def _last_live() -> dict:
+    """ผลสแกนสดล่าสุด เก็บในตัวแอป -> รีเฟรชหน้าเว็บแล้วไม่หาย (หายเมื่อแอปรีสตาร์ท)"""
     return {}
 
 
@@ -138,30 +147,12 @@ with st.sidebar:
     uni_all = get_universe(tuple(sel_idx)) if sel_idx else pd.DataFrame(columns=["MarketCapB", "Major", "Yahoo"])
     in_range = (uni_all["MarketCapB"] >= cap_min) & (uni_all["MarketCapB"] <= cap_max)
     uni_sel = uni_all[in_range | (uni_all["MarketCapB"].isna() & uni_all["Major"].astype(bool) & cap_unknown)]
-    est_min = len(uni_sel) / 494 * (2.5 if source == ALPACA else 3.0)
+    est_min = len(uni_sel) / 617 * 2.0
     st.caption(f"รวม {len(uni_all):,} ตัว → ผ่าน market cap **{len(uni_sel):,} ตัว** "
-               f"· สแกนครั้งแรกประมาณ {max(est_min, 0.3):.0f} นาที")
+               f"· สแกนสดครั้งแรกประมาณ {max(est_min, 0.3):.0f} นาที")
     if len(uni_sel) > 1200:
         st.warning("หุ้นเยอะมาก จะใช้เวลานานและอาจใช้ RAM เกินแผนฟรีของ Streamlit "
                    "แนะนำเพิ่ม market cap ขั้นต่ำ (เช่น 2B ขึ้นไป)")
-
-    st.subheader("Higher Low / Price vs X")
-    sel_tfs = st.multiselect("TF ที่ใช้คัด", TFS, default=TFS)
-    cond = st.radio("ต้องเป็น ✅", ["Higher Low ✅ + Price vs X ✅", "Higher Low ✅ อย่างเดียว"])
-    match_mode = st.radio("ใน", ["อย่างน้อย 1 TF", "ทุก TF ที่เลือก"], horizontal=True)
-    fresh_only = st.checkbox("เฉพาะที่เพิ่งเกิด Alert (HL ✅ + X ✅) ภายใน N แท่ง", False)
-    fresh = st.number_input("N แท่ง (ของแต่ละ TF)", 0, 100, 3, disabled=not fresh_only)
-    confirmed_only = st.checkbox("ใช้เฉพาะแท่งที่ปิดแล้ว (No Repaint)", True)
-
-    with st.expander("Stochastic / State machine (ตรงกับ input ใน Pine)"):
-        iK = st.number_input("%K Length", 2, 100, 9)
-        iSm = st.number_input("Smooth", 1, 20, 3)
-        iOS = st.number_input("Oversold Level", 1.0, 50.0, 20.0)
-        iOB = st.number_input("Overbought Level", 50.0, 99.0, 80.0)
-        iReset = st.number_input("Max Scan Bars", 5, 500, 80)
-        iTrail = st.number_input("Trail Bars after exitOS", 0, 50, 5)
-        iLb = st.number_input("SW Low Lookback Bars (fix lag)", 0, 10, 3)
-        iTimeout = st.checkbox("Close Cycle if Max Scan Bars Timeout", True)
 
     st.subheader("📏 MTF EMA89 4H")
     use_ema = st.checkbox("ราคาต้องอยู่เหนือ EMA 4H", True)
@@ -169,85 +160,86 @@ with st.sidebar:
     ema_conf = st.checkbox("ใช้แท่ง 4H ที่ปิดแล้ว (No Repaint)", True,
                            help="เหมือน iEmaConfirmed ใน Pine: เปิด = ema[1] + lookahead_on")
 
-    with st.expander("📐 Fibo Support (ไม่บังคับ)"):
-        show_fibo = st.checkbox("แสดงคอลัมน์ Fibo ในผลสแกน", False)
-        fibo_src = st.selectbox("Fibo Source", list(FIBO_TF), index=0)
-        fib_names = [n for n, _ in FIB_LEVELS] + ["SW Low"]
-        fib_use = st.multiselect("ระดับที่นับเป็นแนวรับ", fib_names, default=fib_names)
-        fib_filter = st.checkbox("กรองเฉพาะราคาใกล้แนวรับ Fibo", False, disabled=not show_fibo)
-        fib_maxd = st.number_input("ห่างจากแนวรับใกล้สุดไม่เกิน (%)", 0.1, 50.0, 3.0, step=0.5)
+    st.subheader("📐 หัว Fibo (Auto)")
+    up_req = st.multiselect("ต้องมีหัว Fibo ขาขึ้นใน", TFS, default=[],
+                            help="ว่าง = ไม่กรอง (แสดงทุกตัวที่ผ่าน EMA)")
+    up_mode = st.radio("เงื่อนไข", ["อย่างน้อย 1 TF", "ทุก TF ที่เลือก"], horizontal=True,
+                       disabled=len(up_req) < 2)
+    dn_mode = st.radio("กลุ่มที่มีหัว Fibo ขาลง (4H หรือ 1H)",
+                       ["แยกเป็นตารางของตัวเอง", "ซ่อน", "แสดงรวมในตารางเดียว"])
+    confirmed_only = st.checkbox("ใช้เฉพาะแท่งที่ปิดแล้ว (No Repaint)", True)
 
-p = Params(stoch_k=int(iK), stoch_smooth=int(iSm), os_level=float(iOS), ob_level=float(iOB),
-           max_scan_bars=int(iReset), trail_bars=int(iTrail), sw_lookback=int(iLb),
-           close_on_timeout=bool(iTimeout), max_bars_since_signal=int(fresh), ema_len=int(ema_len))
-fib_kw = dict(ios=float(iOS), iob=float(iOB), reset=int(iReset), trail=int(iTrail), lookback=int(iLb))
+    with st.expander("Stochastic / State machine (ตรงกับ input ใน Pine)"):
+        iK = st.number_input("%K Length", 2, 100, 9)
+        iSm = st.number_input("Smooth", 1, 20, 3)
+        iOS = st.number_input("Oversold Level", 1.0, 50.0, 20.0)
+        iOB = st.number_input("Overbought Level", 50.0, 99.0, 80.0)
+        st.caption("📈 หัว Fibo ขาขึ้น (กลุ่ม Stochastic)")
+        iReset = st.number_input("Max Scan Bars", 5, 500, 80)
+        iTrail = st.number_input("Trail Bars after exitOS", 0, 50, 5)
+        iLb = st.number_input("SW Low Lookback Bars (fix lag)", 0, 10, 3)
+        iTimeout = st.checkbox("Close Cycle if Max Scan Bars Timeout", True)
+        st.caption("📉 หัว Fibo ขาลง (กลุ่ม Lower High Reversal)")
+        iResetH = st.number_input("Max Scan Bars ", 5, 500, 80)
+        iTrailH = st.number_input("Trail Bars after exitOB", 0, 50, 5)
+        iLbH = st.number_input("SW High Lookback Bars (fix lag)", 0, 10, 3)
+        iTimeoutH = st.checkbox("Close Cycle if Max Scan Bars Timeout ", True)
+
+hp = HeadParams(k_len=int(iK), smooth=int(iSm), os_level=float(iOS), ob_level=float(iOB),
+                reset_low=int(iReset), trail_low=int(iTrail), lookback_low=int(iLb), timeout_low=bool(iTimeout),
+                reset_high=int(iResetH), trail_high=int(iTrailH), lookback_high=int(iLbH),
+                timeout_high=bool(iTimeoutH))
+EMA_COL = f"EMA{int(ema_len)} 4H"
+UP_COLS = {tf: f"หัว Fibo ขาขึ้น {tf}" for tf in TFS}
+DN_COLS = {tf: f"หัว Fibo ขาลง {tf}" for tf in TFS}
+
+
+def _nn(v):
+    return v is None or bool(pd.isna(v))
 
 
 def latest_price(fr: dict) -> float:
     return scanner.latest_price(fr, confirmed_only)
 
 
-def fmt_dt(ts, tf: str):
-    if ts is None or pd.isna(ts):
-        return None
-    return pd.Timestamp(ts).strftime("%d/%m/%Y %H:%M" if tf in ("4H", "1H") else "%d/%m/%Y")
-
-
-def tick(v) -> str:
-    return "—" if v is None else ("✅" if v else "❌")
-
-
-def tf_ok(s: dict) -> bool:
-    """TF นี้เข้าเงื่อนไขตามที่เลือกในแถบซ้ายไหม"""
-    if s["hl"] is not True:
-        return False
-    if cond.startswith("Higher Low ✅ + ") and s["px"] is not True:
-        return False
-    if fresh_only and not (s["px"] is True and s["bars_since"] is not None and s["bars_since"] <= fresh):
-        return False
-    return True
-
-
 def tf_frame(fr: dict, tf: str):
     return scanner.tf_frame(fr, tf, confirmed_only)
 
 
-def fibo_for(fr: dict, price: float) -> dict:
-    tf = FIBO_TF[fibo_src]
-    df = fr.get(tf)
-    if df is None:
-        return fibo_levels(None, fibo_src, price)
-    closed = True if confirmed_only else last_bar_closed(df, tf)
-    if confirmed_only:
-        df = drop_unclosed(df, tf)
-    f = fibo_levels(df, fibo_src, price, closed, **fib_kw)
-    below = {n: v for n, v in f["levels"].items() if n in fib_use and v <= price}
-    if below:
-        nm = max(below, key=below.get)
-        f.update(support_name=nm, support=below[nm], support_dist=(below[nm] / price - 1) * 100)
-    else:
-        f.update(support_name=None, support=NAN, support_dist=NAN)
-    return f
+IDX_SHORT = {"S&P 500": "SPX", "NASDAQ 100": "NDX", "Dow Jones 30": "DJI", "NASDAQ Composite": "IXIC"}
 
 
-def tf_rows(sym: str, fr: dict) -> list[dict]:
-    """ค่าแบบ Dashboard (W / D / 4H) ของหุ้น 1 ตัว สำหรับเทียบกับ TradingView"""
-    price = latest_price(fr)
-    e4 = mtf_ema(fr.get("4H"), "4H", p.ema_len, ema_conf)
-    rows = []
-    for tf in ["W", "D", "4H"]:
-        d = tf_frame(fr, tf)
-        s = tf_state(d, p)
-        rows.append({
-            "Symbol": sym, "TF": tf,
-            "แท่งล่าสุด": None if d is None else d.index[-1].strftime("%d/%m/%Y %H:%M" if tf == "4H" else "%d/%m/%Y"),
-            "Previous SW": r2(s["prev"]), "SW Low": r2(s["sw"]), "Higher Low": tick(s["hl"]),
-            "X": r2(s["x"]), "Price vs X": tick(s["px"]),
-            "Close (TF)": None if d is None else r2(d["Close"].iloc[-1]),
-            "Alert ล่าสุด": fmt_dt(s["alert_date"], tf),
-            f"EMA{p.ema_len} 4H": (None if e4 != e4 else f"{'✅' if price > e4 else '❌'} {e4:,.2f}") if tf == "4H" else "",
-        })
-    return rows
+def short_idx(s) -> str:
+    """ย่อชื่อดัชนีให้ตารางแคบลง (SPX · NDX · DJI · IXIC)"""
+    if _nn(s):
+        return ""
+    out = str(s)
+    for k, v in IDX_SHORT.items():
+        out = out.replace(k, v)
+    return out.replace(", ", " · ")
+
+
+def hv(v) -> str:
+    """ค่าหัว Fibo แบบเดียวกับ Dashboard บน TradingView ("#.####" หรือ "-")"""
+    return "-" if _nn(v) else f"{float(v):.4f}".rstrip("0").rstrip(".")
+
+
+def head_cell(v, show_val: bool) -> str:
+    if _nn(v):
+        return "-"
+    return f"✅ {v:,.2f}" if show_val else "✅"
+
+
+def stat_text(stats) -> str:
+    """สถานะการดึงข้อมูลบนแถบความคืบหน้า"""
+    if not stats or not stats.get("req"):
+        return ""
+    t = f" · คำขอ {stats['req']} (เฉลี่ย {stats['sec'] / stats['req']:.1f} วิ/ครั้ง)"
+    if stats["r429"]:
+        t += f" · ⚠️ โดน Alpaca จำกัด {stats['r429']} ครั้ง (มีการสแกนอื่นใช้ Key เดียวกันอยู่หรือเปล่า?)"
+    if stats["timeouts"] or stats["errors"]:
+        t += f" · หมดเวลา {stats['timeouts']} · ผิดพลาด {stats['errors']}"
+    return t
 
 
 AUTO_DIR = Path(__file__).parent / "results"
@@ -259,56 +251,33 @@ def load_auto(mtime: float):
     return scanner.load_raw(AUTO_CSV, AUTO_META)
 
 
-def _nn(v):
-    return v is None or bool(pd.isna(v))
-
-
-def fibo_extra(fr: dict, price: float) -> dict:
-    fb = fibo_for(fr, price)
-    return {"fibo_label": fb["label"], "fibo_name": fb["support_name"],
-            "fibo_support": fb["support"], "fibo_dist": fb["support_dist"]}
-
-
-def present(raw: pd.DataFrame) -> pd.DataFrame:
-    """กรองสถานะดิบตามเงื่อนไขในแถบซ้าย -> ตารางผล"""
+def present(raw: pd.DataFrame, show_val: bool) -> pd.DataFrame:
+    """กรองสถานะดิบตามเงื่อนไขในแถบซ้าย -> ตารางผล (คอลัมน์ตามที่กำหนด) + คอลัมน์ช่วยจัดกลุ่ม"""
     rows = []
     for rec in raw.to_dict("records"):
         price, e4 = rec["Price"], rec["EMA4H"]
         above = (not _nn(e4)) and price > e4
         if use_ema and not above:
             continue
-        sts = {tf: {"hl": rec[f"{tf}_hl"], "px": rec[f"{tf}_px"], "x": rec[f"{tf}_x"], "sw": rec[f"{tf}_sw"],
-                    "prev": rec[f"{tf}_prev"], "alert_date": rec[f"{tf}_alert"],
-                    "bars_since": None if _nn(rec[f"{tf}_bs"]) else int(rec[f"{tf}_bs"])} for tf in TFS}
-        hits = [tf for tf in sel_tfs if tf_ok(sts[tf])]
-        ok = bool(hits) if match_mode == "อย่างน้อย 1 TF" else len(hits) == len(sel_tfs)
-        if not ok:
-            continue
+        ups = {tf: rec[f"{tf}_up"] for tf in TFS}
+        dns = {tf: rec[f"{tf}_dn"] for tf in TFS}
+        if up_req:
+            hit = [tf for tf in up_req if not _nn(ups[tf])]
+            if (up_mode == "ทุก TF ที่เลือก" and len(hit) < len(up_req)) or not hit:
+                continue
         row = {
-            "Symbol": rec["Symbol"], "Name": rec["Name"], "Index": rec["Index"], "Sector": rec["Sector"],
+            "Symbol": rec["Symbol"], "Name": rec["Name"], "Index": short_idx(rec["Index"]), "Sector": rec["Sector"],
             "MktCap (B)": r2(rec["MarketCapB"]), "Price": r2(price),
-            f"EMA{p.ema_len} 4H": None if _nn(e4) else f"{'✅' if above else '❌'} {e4:,.2f}",
-            "% จาก EMA": None if _nn(e4) else r2((price / e4 - 1) * 100),
-            "TF เข้า": len(hits),
+            EMA_COL: None if _nn(e4) else f"{'✅' if above else '❌'} {e4:,.2f}",
+            f"% จาก {EMA_COL}": None if _nn(e4) else r2((price / e4 - 1) * 100),
         }
         for tf in TFS:
-            s_ = sts[tf]
-            row[f"{tf} Higher Low"] = tick(s_["hl"])
-            row[f"{tf} Price vs X"] = tick(s_["px"])
-            row[f"{tf} Alert"] = fmt_dt(s_["alert_date"], tf)
-            row[f"{tf} X"] = r2(s_["x"])
-            row[f"{tf} % ถึง X"] = None if _nn(s_["x"]) else r2((s_["x"] / price - 1) * 100)
-            row[f"{tf} SW Low"] = r2(s_["sw"])
-            row[f"{tf} Previous SW"] = r2(s_["prev"])
-            row[f"_bs_{tf}"] = s_["bars_since"] if tf in hits else None
-        if show_fibo and "fibo_label" in rec:
-            d = rec["fibo_dist"]
-            if fib_filter and (_nn(d) or -d > fib_maxd):
-                continue
-            row.update({"Fibo": rec["fibo_label"],
-                        "แนวรับใกล้สุด": None if not rec["fibo_name"] else f"{rec['fibo_name']} @ {rec['fibo_support']:,.2f}",
-                        "% ถึงแนวรับ": r2(d)})
+            row[UP_COLS[tf]] = head_cell(ups[tf], show_val)
+        for tf in TFS:
+            row[DN_COLS[tf]] = head_cell(dns[tf], show_val)
         row["Chart"] = f"https://www.tradingview.com/chart/?symbol={rec['Symbol'].replace('.', '-')}"
+        row["_n_up"] = sum(not _nn(v) for v in ups.values())
+        row["_has_dn"] = any(not _nn(v) for v in dns.values())
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -324,10 +293,16 @@ def in_universe(raw: pd.DataFrame) -> pd.DataFrame:
     return raw[idx_ok & cap_ok]
 
 
-DEFAULT_P = Params()
-custom_params = any(getattr(p, f) != getattr(DEFAULT_P, f) for f in
-                    ("stoch_k", "stoch_smooth", "os_level", "ob_level", "max_scan_bars", "trail_bars",
-                     "sw_lookback", "close_on_timeout", "ema_len"))
+def show_table(df: pd.DataFrame, key: str):
+    st.dataframe(df.drop(columns=["_n_up", "_has_dn"]), hide_index=True, width="stretch", key=key,
+                 column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="TradingView"),
+                                "Name": st.column_config.TextColumn("Name", width="medium"),
+                                "Index": st.column_config.TextColumn("Index", width="small",
+                                                                     help="SPX = S&P 500 · NDX = NASDAQ 100 · "
+                                                                          "DJI = Dow Jones 30 · IXIC = NASDAQ Composite")})
+
+
+custom_params = (hp != HeadParams()) or int(ema_len) != 89
 
 tab_scan, tab_check, tab_cmp = st.tabs(["🔍 สแกนหุ้น", "🧪 ตรวจสอบรายตัว", "📋 เทียบกับ TradingView"])
 
@@ -345,90 +320,101 @@ with tab_scan:
                     "หรือเลือก **สแกนสดตอนนี้**")
         else:
             raw_all, meta_auto = load_auto(AUTO_CSV.stat().st_mtime)
-            raw_view = in_universe(raw_all)
-            when = pd.Timestamp(meta_auto["scanned_at"]).tz_convert("Asia/Bangkok")
-            age_h = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(meta_auto["scanned_at"])).total_seconds() / 3600
-            st.caption(f"📦 สแกนอัตโนมัติเมื่อ **{when:%d %b %Y %H:%M}** (เวลาไทย, {age_h:.0f} ชม.ที่แล้ว) · "
-                       f"แท่ง 4H ล่าสุด {meta_auto.get('last_4h_bar', '—')} (เวลา NY) · "
-                       f"หุ้นในไฟล์ {meta_auto.get('n_symbols', len(raw_all)):,} ตัว "
-                       f"({meta_auto.get('universe', '')}) → ตรงดัชนี/market cap ที่เลือก {len(raw_view):,} ตัว")
-            if custom_params or not confirmed_only or not ema_conf:
-                st.warning("ผลอัตโนมัติคำนวณด้วยค่า Pine ตั้งต้น + แท่งที่ปิดแล้ว "
-                           "ถ้าเปลี่ยนค่า Stochastic / EMA / No Repaint ให้ใช้ **สแกนสดตอนนี้**")
-            if show_fibo:
-                st.caption("Fibo ใช้ได้เฉพาะ **สแกนสดตอนนี้**")
-            meta_view = {"n": len(raw_view), "when": when, "src": "สแกนอัตโนมัติ (Alpaca)",
-                         "load_rep": {}, "idx": list(sel_idx)}
+            if not scanner.is_current_format(raw_all):
+                st.info("ผลสแกนอัตโนมัติในไฟล์ยังเป็นรูปแบบเก่า (Higher Low W/D/4H) — "
+                        "ไปที่ GitHub แท็บ **Actions → Auto scan → Run workflow** เพื่อสแกนใหม่ด้วยหัว Fibo "
+                        "หรือเลือก **สแกนสดตอนนี้**")
+            else:
+                raw_view = in_universe(raw_all)
+                when = pd.Timestamp(meta_auto["scanned_at"]).tz_convert("Asia/Bangkok")
+                age_h = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(meta_auto["scanned_at"])).total_seconds() / 3600
+                st.caption(f"📦 สแกนอัตโนมัติเมื่อ **{when:%d %b %Y %H:%M}** (เวลาไทย, {age_h:.0f} ชม.ที่แล้ว) · "
+                           f"แท่ง 4H ล่าสุด {meta_auto.get('last_4h_bar', '—')} (เวลา NY) · "
+                           f"หุ้นในไฟล์ {meta_auto.get('n_symbols', len(raw_all)):,} ตัว "
+                           f"({meta_auto.get('universe', '')}) → ตรงดัชนี/market cap ที่เลือก {len(raw_view):,} ตัว")
+                if custom_params or not confirmed_only or not ema_conf:
+                    st.warning("ผลอัตโนมัติคำนวณด้วยค่า Pine ตั้งต้น + แท่งที่ปิดแล้ว "
+                               "ถ้าเปลี่ยนค่า Stochastic / EMA / No Repaint ให้ใช้ **สแกนสดตอนนี้**")
+                meta_view = {"n": len(raw_view), "when": when, "src": "สแกนอัตโนมัติ (Alpaca)",
+                             "load_rep": {}, "idx": list(sel_idx)}
     else:
         if need_keys:
             st.warning("ใส่ Alpaca API Key / Secret ที่แถบซ้ายก่อน (หรือเลือก Yahoo Finance)")
         if not sel_idx:
             st.warning("เลือกดัชนีอย่างน้อย 1 ตัวที่แถบซ้าย")
-        run = st.button(f"🔍 สแกน {len(uni_sel):,} ตัว", type="primary",
-                        disabled=not sel_tfs or need_keys or uni_sel.empty)
-        st.caption("⏱️ สแกนสดครั้งแรกใช้ราว 3 นาที (ติดลิมิต Alpaca แผนฟรี) · เปิดหน้านี้ค้างไว้ อย่าให้จอมือถือดับ · "
+        run = st.button(f"🔍 สแกน {len(uni_sel):,} ตัว", type="primary", disabled=need_keys or uni_sel.empty)
+        st.caption("⏱️ สแกนสดครั้งแรกใช้ราว 2 นาที (ติดลิมิต Alpaca แผนฟรี) · เปิดหน้านี้ค้างไว้ อย่าให้จอมือถือดับ · "
                    "ถ้าสแกนหยุดกลางทาง กดสแกนใหม่ จะทำต่อจากชุดที่โหลดเสร็จแล้ว")
         if run:
             with st.status("กำลังสแกน...", expanded=True) as status:
                 uni = uni_sel
                 tickers = tuple(uni["Yahoo"])
                 st.write(f"ดัชนี: {', '.join(sel_idx)} · ผ่านเงื่อนไข market cap: {len(tickers):,} ตัว")
-                need = {"1h", "1d", "1wk"}
-                if show_fibo and FIBO_TF[fibo_src] == "M":
-                    need.add("1mo")
                 store, load_rep = {}, {}
-                for itv in ["1h", "1d", "1wk", "1mo"]:
-                    if itv in need:
-                        t0 = time.time()
-                        label = f"โหลดราคา {itv} จาก {source}"
-                        pb = st.progress(0.0, text=label)
+                itv = "1h"
+                t0 = time.time()
+                label = f"โหลดราคา 1H (สร้าง 4H จาก 1H) จาก {source}"
+                pb = st.progress(0.0, text=label)
 
-                        def _prog(done, total, pb=pb, label=label, t0=t0):
+                def _prog(done, total, pb=pb, label=label, t0=t0, stats=None):
+                    el = time.time() - t0
+                    eta = el / done * (total - done) if done else 0
+                    pb.progress(done / total, text=f"{label} · {done}/{total} กลุ่ม · "
+                                                   f"ผ่านไป {el:.0f} วิ · เหลือราว {eta:.0f} วิ{stat_text(stats)}")
+
+                if source == ALPACA:
+                    # ทีละ 100 ตัว: แต่ละชุดเก็บใน cache ทันที ถ้าหยุดกลางทาง กดสแกนใหม่จะทำต่อจากเดิม
+                    batches = [tickers[i:i + BATCH] for i in range(0, len(tickers), BATCH)]
+                    store[itv] = {}
+                    for bi, bt in enumerate(batches):
+                        def _bprog(done, total, bi=bi, nb=len(batches), pb=pb, label=label, t0=t0, stats=None):
+                            frac = (bi + done / total) / nb
                             el = time.time() - t0
-                            eta = el / done * (total - done)
-                            pb.progress(done / total, text=f"{label} · {done}/{total} กลุ่ม · "
-                                                           f"ผ่านไป {el:.0f} วิ · เหลือราว {eta:.0f} วิ")
-
-                        if source == ALPACA and itv in ("1h", "1d"):
-                            # ทีละ 100 ตัว: แต่ละชุดเก็บใน cache ทันที ถ้าหยุดกลางทาง กดสแกนใหม่จะทำต่อจากเดิม
-                            batches = [tickers[i:i + BATCH] for i in range(0, len(tickers), BATCH)]
-                            store[itv] = {}
-                            for bi, bt in enumerate(batches):
-                                def _bprog(done, total, bi=bi, nb=len(batches), pb=pb, label=label, t0=t0):
-                                    frac = (bi + done / total) / nb
-                                    el = time.time() - t0
-                                    eta = el / frac * (1 - frac) if frac > 0 else 0
-                                    pb.progress(min(frac, 1.0), text=f"{label} · ชุด {bi + 1}/{nb} · "
-                                                                     f"ผ่านไป {el:.0f} วิ · เหลือราว {eta:.0f} วิ")
-                                store[itv].update(get_prices(bt, itv, _bprog))
-                                _bprog(1, 1)
-                        else:
-                            store[itv] = get_prices(tickers, itv, _prog)
-                        pb.progress(1.0, text=f"{label} · เสร็จใน {time.time() - t0:.0f} วิ")
-                        load_rep[itv] = (len(store[itv]), sorted(set(tickers) - set(store[itv])))
-                        st.write(f"→ ได้ {load_rep[itv][0]}/{len(tickers)} ตัว")
-                st.write("รัน Higher Low บน 4H / D / W + EMA89 4H")
-                raw = scanner.raw_states(uni, store, p, confirmed_only, ema_conf,
-                                         extra=fibo_extra if show_fibo else None)
+                            eta = el / frac * (1 - frac) if frac > 0 else 0
+                            pb.progress(min(frac, 1.0), text=f"{label} · ชุด {bi + 1}/{nb} · "
+                                                             f"ผ่านไป {el:.0f} วิ · เหลือราว {eta:.0f} วิ"
+                                                             f"{stat_text(stats)}")
+                        store[itv].update(get_prices(bt, itv, _bprog))
+                        _bprog(1, 1)
+                else:
+                    store[itv] = get_prices(tickers, itv, _prog)
+                pb.progress(1.0, text=f"{label} · เสร็จใน {time.time() - t0:.0f} วิ")
+                load_rep[itv] = (len(store[itv]), sorted(set(tickers) - set(store[itv])))
+                st.write(f"→ ได้ {load_rep[itv][0]}/{len(tickers)} ตัว")
+                st.write("คำนวณหัว Fibo ขาขึ้น / ขาลง (4H / 1H) + EMA89 4H")
+                raw = scanner.raw_states(uni, store, hp, int(ema_len), confirmed_only, ema_conf)
                 st.session_state["raw_live"] = raw
                 st.session_state["meta_live"] = {"n": len(tickers), "when": pd.Timestamp.now(tz="Asia/Bangkok"),
                                                  "src": source, "load_rep": load_rep, "idx": list(sel_idx)}
+                _last_live().update(raw=raw, meta=st.session_state["meta_live"])
                 status.update(label="สแกนเสร็จ", state="complete", expanded=False)
-        if "raw_live" in st.session_state:
+        if "raw_live" not in st.session_state and _last_live().get("raw") is not None:
+            st.session_state["raw_live"] = _last_live()["raw"]              # กลับมาหลังรีเฟรชหน้าเว็บ
+            st.session_state["meta_live"] = _last_live()["meta"]
+        if "raw_live" in st.session_state and scanner.is_current_format(st.session_state["raw_live"]):
             raw_view, meta_view = st.session_state["raw_live"], st.session_state["meta_live"]
-            st.caption("💡 เปลี่ยนเงื่อนไข Higher Low / EMA / Sector ทางซ้ายได้เลย ตารางอัปเดตทันทีโดยไม่ต้องสแกนใหม่")
+            st.caption("💡 เปลี่ยนเงื่อนไข EMA / หัว Fibo / Sector ทางซ้ายได้เลย ตารางอัปเดตทันทีโดยไม่ต้องสแกนใหม่")
         else:
             st.info("เลือกดัชนีและตั้งเงื่อนไขทางซ้าย แล้วกดปุ่ม **สแกน**")
 
     if raw_view is not None:
-        res = present(raw_view)
+        f1, f2 = st.columns([3, 1])
+        show_val = f2.toggle("แสดงราคาหัว Fibo", False)
+        res = present(raw_view, show_val)
+        if not res.empty:
+            secs = sorted(res["Sector"].astype(str).unique())
+            pick = f1.multiselect("กรอง Sector", secs, default=secs)
+            res = res[res["Sector"].astype(str).isin(pick)]
+        up_any = res["_n_up"].gt(0) if not res.empty else pd.Series(dtype=bool)
+        has_dn = res["_has_dn"] if not res.empty else pd.Series(dtype=bool)
         m = st.columns(5)
         m[0].metric("สแกนทั้งหมด", f"{meta_view['n']:,}")
-        m[1].metric("เข้าเงื่อนไข", len(res))
-        for col, tf in zip(m[2:], TFS):
-            both = ((res[f"{tf} Higher Low"] == "✅") & (res[f"{tf} Price vs X"] == "✅")).sum() if not res.empty else 0
-            col.metric(f"{tf}  HL ✅ X ✅", int(both))
-        st.caption(f"ดัชนี: {', '.join(meta_view['idx'])} · TF: {', '.join(sel_tfs)} ({match_mode}) · "
+        m[1].metric("ผ่านเงื่อนไข", len(res))
+        m[2].metric("📈 หัวขาขึ้น 4H", int((res[UP_COLS['4H']] != "-").sum()) if not res.empty else 0)
+        m[3].metric("📈 หัวขาขึ้น 1H", int((res[UP_COLS['1H']] != "-").sum()) if not res.empty else 0)
+        m[4].metric("📉 มีหัวขาลง", int(has_dn.sum()) if not res.empty else 0)
+        st.caption(f"ดัชนี: {', '.join(meta_view['idx'])} · "
+                   f"{'ราคา > ' + EMA_COL if use_ema else 'ไม่กรอง EMA'} · "
                    f"ราคาจาก {meta_view['src']} · ข้อมูลเมื่อ {meta_view['when']:%d %b %Y %H:%M} (เวลาไทย)")
         missing = {itv: miss for itv, (_, miss) in meta_view["load_rep"].items() if miss}
         if missing:
@@ -438,155 +424,157 @@ with tab_scan:
         if res.empty:
             st.warning("ไม่มีหุ้นเข้าเงื่อนไข")
         else:
-            f1, f2 = st.columns([3, 1])
-            secs = sorted(res["Sector"].astype(str).unique())
-            pick = f1.multiselect("กรอง Sector", secs, default=secs)
-            detail = f2.toggle("แสดงรายละเอียด X / SW Low", False)
-            view = res[res["Sector"].astype(str).isin(pick)].copy()
-            bs = [c for c in view.columns if c.startswith("_bs_")]
-            view["_s"] = view[bs].min(axis=1, skipna=True)
-            view = view.sort_values(["TF เข้า", "_s"], ascending=[False, True], na_position="last")
-            view = view.drop(columns=bs + ["_s"])
-            keep = ("Higher Low", "Price vs X", "Alert")
-            if not detail:
-                view = view.drop(columns=[c for c in view.columns
-                                          if any(c.startswith(f"{tf} ") for tf in TFS) and not c.endswith(keep)])
-            st.dataframe(view, hide_index=True, width="stretch",
-                         column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="TradingView")})
-            st.download_button("⬇️ ดาวน์โหลด CSV",
-                               res.drop(columns=[c for c in res.columns if c.startswith("_bs_")])
-                               .to_csv(index=False).encode("utf-8-sig"),
-                               "scan_result.csv", "text/csv")
+            res = res.sort_values(["_n_up", f"% จาก {EMA_COL}"], ascending=[False, True], na_position="last")
+            if dn_mode == "แสดงรวมในตารางเดียว":
+                show_table(res, "t_all")
+            else:
+                clean, dn = res[~res["_has_dn"]], res[res["_has_dn"]]
+                st.markdown(f"#### 🟢 ไม่มีหัว Fibo ขาลง — {len(clean):,} ตัว")
+                if clean.empty:
+                    st.caption("ไม่มี")
+                else:
+                    show_table(clean, "t_clean")
+                if dn_mode == "แยกเป็นตารางของตัวเอง":
+                    st.markdown(f"#### 🔴 มีหัว Fibo ขาลง (4H หรือ 1H) — {len(dn):,} ตัว")
+                    if dn.empty:
+                        st.caption("ไม่มี")
+                    else:
+                        show_table(dn, "t_dn")
+                else:
+                    st.caption(f"ซ่อนหุ้นที่มีหัว Fibo ขาลง {len(dn):,} ตัว")
+            out = res.copy()
+            out.insert(0, "กลุ่ม", np.where(out["_has_dn"], "มีหัว Fibo ขาลง", "ไม่มีหัว Fibo ขาลง"))
+            st.download_button("⬇️ ดาวน์โหลด CSV", out.drop(columns=["_n_up", "_has_dn"])
+                               .to_csv(index=False).encode("utf-8-sig"), "scan_result.csv", "text/csv")
+
+
+def head_detail(df: pd.DataFrame) -> dict:
+    """ค่าภายในของ state machine (แท่งล่าสุด) + หัว Fibo ทั้งสองฝั่ง"""
+    lo, hi = trigger_low_m(df, hp), trigger_high(df, hp)
+    up, dn = head_latch_low(df, hp), head_latch_high(df, hp)
+    return {"lo": lo, "hi": hi, "up": up, "dn": dn}
+
+
+def tf_rows(sym: str, fr: dict) -> list[dict]:
+    """ค่าแบบ Combined Dashboard (หัว Fibo 4H / 1H) ของหุ้น 1 ตัว สำหรับเทียบกับ TradingView"""
+    price = latest_price(fr)
+    e4 = mtf_ema(fr.get("4H"), "4H", int(ema_len), ema_conf)
+    rows = []
+    for tf in TFS:
+        d = tf_frame(fr, tf)
+        if d is None:
+            continue
+        hd = head_detail(d)
+        rows.append({
+            "Symbol": sym, "TF": tf, "แท่งล่าสุด (NY)": d.index[-1].strftime("%d/%m/%Y %H:%M"),
+            "📈 หัว Fibo ขาขึ้น": hv(hd["up"][-1]),
+            "📉 หัว Fibo ขาลง": hv(hd["dn"][-1]),
+            "Close (TF)": r2(d["Close"].iloc[-1]),
+            EMA_COL: (None if _nn(e4) else f"{'✅' if price > e4 else '❌'} {e4:,.2f}") if tf == "4H" else "",
+        })
+    return rows
+
 
 # =====================================================================
 with tab_check:
-    st.markdown("กรอก symbol แล้วเทียบกับ Dashboard (W / D / 4H) และ label บน TradingView")
+    st.markdown("กรอก symbol แล้วเทียบกับ **Combined Mode** (แถว 📈 หัว Fibo ขาขึ้น / 📉 หัว Fibo ขาลง) บน TradingView")
     cc1, cc2, cc3 = st.columns([2, 1, 1])
     sym = cc1.text_input("Symbol", "NVDA").strip().upper()
-    ctf = cc2.selectbox("TF ของกราฟ", ["4H", "D", "W"], key="ctf")
+    ctf = cc2.selectbox("TF ของกราฟ", TFS, key="ctf")
     go_btn = cc3.button("ตรวจสอบ", type="primary", disabled=need_keys)
     if go_btn and sym:
         y = sym.replace(".", "-")
-        itvs = ["1h", "1d", "1wk"] + (["1mo"] if FIBO_TF[fibo_src] == "M" else [])
-        fr = frames_for(y, {itv: get_prices((y,), itv) for itv in itvs})
+        fr = frames_for(y, {"1h": get_prices((y,), "1h")})
         if tf_frame(fr, ctf) is None:
             st.error("โหลดข้อมูลไม่ได้ ตรวจสอบ symbol")
         else:
             price = latest_price(fr)
-            e4 = mtf_ema(fr.get("4H"), "4H", p.ema_len, ema_conf)
-            st.subheader(f"Dashboard  ·  Price {price:,.2f}  ·  EMA{p.ema_len} 4H "
-                         + ("—" if e4 != e4 else f"{'✅' if price > e4 else '❌'} {e4:,.2f}"))
+            e4 = mtf_ema(fr.get("4H"), "4H", int(ema_len), ema_conf)
+            st.subheader(f"{sym}  ·  Price {price:,.2f}  ·  {EMA_COL} "
+                         + ("—" if _nn(e4) else f"{'✅' if price > e4 else '❌'} {e4:,.2f}"))
             dash, engines = [], {}
-            for tf in ["W", "D", "4H"]:
+            for tf in TFS:
                 d = tf_frame(fr, tf)
                 if d is None:
                     continue
-                rr_ = hl_engine(d, p)
-                engines[tf] = (d, rr_)
-                last = rr_.iloc[-1]
-                s = tf_state(d, p)
+                hd = head_detail(d)
+                engines[tf] = (d, hd)
+                lo, hi = hd["lo"], hd["hi"]
                 dash.append({
-                    "TF": tf, "Previous SW": r2(s["prev"]), "SW Low": r2(s["sw"]),
-                    "Higher Low": tick(s["hl"]), "X": r2(s["x"]), "Price vs X": tick(s["px"]),
-                    "Close (TF)": r2(last["Close"]), "Alert ล่าสุด": fmt_dt(s["alert_date"], tf),
-                    "%K": r2(last["k"]), "Oversold": "🔴" if last["isOS"] else "",
+                    "TF": tf, "แท่งล่าสุด (NY)": d.index[-1].strftime("%d/%m/%Y %H:%M"),
+                    "📈 หัว Fibo ขาขึ้น": hv(hd["up"][-1]),
+                    "📉 หัว Fibo ขาลง": hv(hd["dn"][-1]),
+                    "SW Low": r2(lo["sw"][-1]), "Prev SW Low": r2(lo["prev"][-1]), "X (ขาขึ้น)": r2(lo["x"][-1]),
+                    "SW High": r2(hi["sw"][-1]), "Prev SW High": r2(hi["prev"][-1]), "X (ขาลง)": r2(hi["x"][-1]),
+                    "%K": r2(lo["k"][-1]), "Close (TF)": r2(d["Close"].iloc[-1]),
                 })
             st.dataframe(pd.DataFrame(dash), hide_index=True, width="stretch")
+            st.caption("SW / Prev / X ด้านขวาคือค่าภายในของ state machine (f_htfTriggerLowM / f_htfTriggerHigh) "
+                       "ไว้ช่วยไล่หาสาเหตุถ้าหัว Fibo ไม่ตรงกับ TradingView")
 
-            if show_fibo:
-                fb = fibo_for(fr, price)
-                st.subheader(f"📐 Fibo Sup [{fb['label']}]")
-                if fb["levels"]:
-                    lv = [("🔺 SW High (0%)", fb["sw_high"])] + [(f"📊 {nm}", fb["levels"][nm]) for nm, _ in FIB_LEVELS] \
-                         + [("🔻 SW Low (100%)", fb["sw_low"])]
-                    st.dataframe(pd.DataFrame([{"Level": nm, "Price": r2(v),
-                                                "Dist%": f"{(v - price) / price * 100:+.2f}%",
-                                                "Status": "✅ Above" if price > v else "🔴 Below"} for nm, v in lv]),
-                                 hide_index=True)
-                else:
-                    st.info("ยังไม่มีชุด Fibo")
-
-            df, r = engines[ctf]
-            ev = r[r["alert"]].copy()
-            ev["SW Low date"] = [fmt_dt(df.index[int(b)], ctf) if b >= 0 else None for b in ev["sw_bar"]]
-            st.subheader(f"ประวัติ Alert {ctf} 'Higher Low ✅ + Price > X ✅' ({len(ev)} ครั้ง)")
-            tbl = ev[["Close", "prev_sw", "sw", "SW Low date", "x_live"]].rename(
-                columns={"prev_sw": "Previous SW", "sw": "SW Low", "x_live": "X"})
-            num = ["Close", "Previous SW", "SW Low", "X"]
-            tbl[num] = tbl[num].round(2)
-            tbl = tbl.sort_index(ascending=False).head(30)
-            tbl.insert(0, "Alert เมื่อ", [fmt_dt(t, ctf) for t in tbl.index])
-            st.dataframe(tbl, hide_index=True, width="stretch")
-
+            df, hd = engines[ctf]
             show = df.tail(250)
-            rr = r.loc[show.index]
+            n0 = len(df) - len(show)
             fig = go.Figure()
             fig.add_candlestick(x=show.index, open=show["Open"], high=show["High"], low=show["Low"],
                                 close=show["Close"], name=sym)
-            fig.add_scatter(x=show.index, y=rr["x_live"], mode="lines", line=dict(shape="hv", width=1.5),
-                            name="X (xLive)")
-            fig.add_scatter(x=show.index, y=rr["sw"], mode="lines", line=dict(shape="hv", width=1, dash="dot"),
-                            name="SW Low")
+            fig.add_scatter(x=show.index, y=hd["up"][n0:], mode="lines", line=dict(shape="hv", width=2, color="#26a69a"),
+                            name="📈 หัว Fibo ขาขึ้น")
+            fig.add_scatter(x=show.index, y=hd["dn"][n0:], mode="lines", line=dict(shape="hv", width=2, color="#ef5350"),
+                            name="📉 หัว Fibo ขาลง")
             if ctf == "4H":
-                fig.add_scatter(x=show.index, y=ema(df["Close"], p.ema_len).loc[show.index], mode="lines",
-                                line=dict(width=2), name=f"EMA{p.ema_len} 4H")
-            elif e4 == e4:
-                fig.add_hline(y=e4, line=dict(width=2, dash="dash"),
-                              annotation_text=f"4H EMA{p.ema_len} {e4:,.2f}", annotation_position="right")
-            a = rr[rr["alert"]]
-            fig.add_scatter(x=a.index, y=show.loc[a.index, "Low"] * 0.985, mode="markers",
-                            marker=dict(symbol="triangle-up", size=12), name="Alert")
+                fig.add_scatter(x=show.index, y=ema(df["Close"], int(ema_len)).iloc[n0:], mode="lines",
+                                line=dict(width=1.5, color="#2196f3"), name=EMA_COL)
+            elif not _nn(e4):
+                fig.add_hline(y=e4, line=dict(width=1.5, dash="dash", color="#2196f3"),
+                              annotation_text=f"{EMA_COL} {e4:,.2f}", annotation_position="right")
             fig.update_layout(height=600, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10),
                               legend=dict(orientation="h"))
-            if ctf == "4H":
-                fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[16, 9.5], pattern="hour")])
-            elif ctf == "D":
-                fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+            fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[16, 9.5], pattern="hour")])
             st.plotly_chart(fig, width="stretch")
 
 # =====================================================================
 with tab_cmp:
     st.markdown(
-        "กรอกได้สูงสุด 10 symbol แอปจะออกตารางค่า **W / D / 4H** แบบเดียวกับ Dashboard บน TradingView "
+        "กรอกได้สูงสุด 10 symbol แอปจะออกตารางหัว Fibo **4H / 1H** แบบเดียวกับ Combined Mode บน TradingView "
         "ให้เปิดกราฟแต่ละตัวแล้วเทียบทีละแถว\n\n"
-        "- เกณฑ์แนะนำ: ติ๊ก ✅/❌ ตรงกันอย่างน้อย 9/10 ตัว และค่า X / SW Low ต่างไม่เกินราว 0.1%\n"
+        "- ค่าที่ควรตรง: มี/ไม่มีหัว (✅ / -) และราคาหัว (ต่างได้ระดับเซนต์จากแหล่งข้อมูล)\n"
         "- ดาวน์โหลด CSV แล้วกรอกค่าจาก TradingView ลงคอลัมน์ `TV ...` ได้ ถ้าเจอตัวไม่ตรงส่งไฟล์นั้นมาให้ไล่แก้")
     raw_syms = st.text_area("Symbols (คั่นด้วยจุลภาค, เว้นวรรค หรือขึ้นบรรทัดใหม่)",
                             "NVDA, AMD, AVGO, MU, AMAT, LRCX, KLAC, QCOM, TXN, ADI")
     syms = []
-    for s in raw_syms.replace(",", " ").split():
-        s = s.strip().upper()
-        if s and s not in syms:
-            syms.append(s)
+    for s_ in raw_syms.replace(",", " ").split():
+        s_ = s_.strip().upper()
+        if s_ and s_ not in syms:
+            syms.append(s_)
     if len(syms) > 10:
         st.warning(f"ใช้ 10 ตัวแรก (กรอกมา {len(syms)} ตัว)")
         syms = syms[:10]
     cmp_btn = st.button("📋 สร้างตารางเทียบ", type="primary", disabled=not syms or need_keys)
     if cmp_btn:
-        ys = tuple(s.replace(".", "-") for s in syms)
+        ys = tuple(s_.replace(".", "-") for s_ in syms)
         with st.spinner(f"โหลดราคา {len(ys)} ตัวจาก {source}..."):
-            store = {itv: get_prices(ys, itv) for itv in ("1h", "1d", "1wk")}
+            store = {"1h": get_prices(ys, "1h")}
         rows, bad = [], []
-        for sym, y in zip(syms, ys):
+        for sym_, y in zip(syms, ys):
             fr = frames_for(y, store)
             if not fr:
-                bad.append(sym)
+                bad.append(sym_)
                 continue
-            rows += tf_rows(sym, fr)
+            rows += tf_rows(sym_, fr)
         if bad:
             st.warning(f"โหลดข้อมูลไม่ได้: {', '.join(bad)}")
         if rows:
-            cmp = pd.DataFrame(rows)
-            st.session_state["cmp"] = cmp
+            st.session_state["cmp"] = pd.DataFrame(rows)
             st.session_state["cmp_meta"] = (source, pd.Timestamp.now(tz="Asia/Bangkok"))
-    if "cmp" in st.session_state:
+    if "cmp" in st.session_state and "📈 หัว Fibo ขาขึ้น" in st.session_state["cmp"].columns:
         cmp = st.session_state["cmp"]
         src_used, when = st.session_state["cmp_meta"]
         st.caption(f"ราคาจาก {src_used} · สร้างเมื่อ {when:%d %b %Y %H:%M} (เวลาไทย) · "
                    + ("ใช้เฉพาะแท่งที่ปิดแล้ว" if confirmed_only else "รวมแท่งที่ยังไม่ปิด"))
-        st.dataframe(cmp, hide_index=True, width="stretch", height=min(40 + 35 * len(cmp), 1100))
+        st.dataframe(cmp, hide_index=True, width="stretch", height=min(40 + 35 * len(cmp), 900))
         out = cmp.copy()
-        for c in ["TV Previous SW", "TV SW Low", "TV Higher Low", "TV X", "TV Price vs X", "ตรงไหม (✓/✗)"]:
+        for c in ["TV หัว Fibo ขาขึ้น", "TV หัว Fibo ขาลง", "ตรงไหม (✓/✗)"]:
             out[c] = ""
         st.download_button("⬇️ ดาวน์โหลด CSV (มีคอลัมน์ว่างไว้กรอกค่า TradingView)",
                            out.to_csv(index=False).encode("utf-8-sig"), "compare_tradingview.csv", "text/csv")
