@@ -14,12 +14,12 @@ import math
 import pandas as pd
 
 from fibo import drop_unclosed, mtf_ema
-from heads import HeadParams, heads_last
+from heads import HeadParams, heads_with_clear
 from logic import resample_4h
 
 TFS = ["4H", "1H"]
 NAN = float("nan")
-FORMAT = "fibo-heads-v1"
+FORMAT = "fibo-heads-v2"     # v2: เพิ่ม dn_clear_at (Watchlist)
 
 
 def frames_for(t: str, store: dict) -> dict:
@@ -50,12 +50,10 @@ def symbol_state(meta: dict, fr: dict, hp: HeadParams, ema_len: int, confirmed_o
     if math.isnan(price):
         return None
     row = {**meta, "Price": price, "EMA4H": mtf_ema(fr.get("4H"), "4H", ema_len, ema_conf)}
-    for tf in TFS:
-        d = tf_frame(fr, tf, confirmed_only)
-        up, dn = heads_last(d, hp)
-        row[f"{tf}_up"] = up
-        row[f"{tf}_dn"] = dn
-        row[f"{tf}_last"] = None if d is None else d.index[-1]
+    d1, d4 = tf_frame(fr, "1H", confirmed_only), tf_frame(fr, "4H", confirmed_only)
+    row.update(heads_with_clear(d1, d4, hp))
+    row["4H_last"] = None if d4 is None else d4.index[-1]
+    row["1H_last"] = None if d1 is None else d1.index[-1]
     return row
 
 
@@ -75,11 +73,15 @@ def is_current_format(raw: pd.DataFrame) -> bool:
     return all(f"{tf}_{s}" in raw.columns for tf in TFS for s in ("up", "dn"))
 
 
+def has_watchlist(raw: pd.DataFrame) -> bool:
+    return "dn_clear_at" in raw.columns
+
+
 # ---------- บันทึก / โหลดผล (สำหรับสแกนอัตโนมัติ) ----------
 def save_raw(raw: pd.DataFrame, path_csv, meta: dict, path_meta) -> None:
     out = raw.copy()
     for c in out.columns:
-        if c.endswith("_last"):
+        if c.endswith(("_last", "_at")):
             out[c] = [None if v is None or (isinstance(v, float) and math.isnan(v)) else pd.Timestamp(v).isoformat()
                       for v in out[c]]
     out.to_csv(path_csv, index=False)
@@ -90,7 +92,7 @@ def save_raw(raw: pd.DataFrame, path_csv, meta: dict, path_meta) -> None:
 def load_raw(path_csv, path_meta) -> tuple[pd.DataFrame, dict]:
     raw = pd.read_csv(path_csv, keep_default_na=True)
     for c in raw.columns:
-        if c.endswith("_last"):
+        if c.endswith(("_last", "_at")):
             raw[c] = [None if (isinstance(v, float) and math.isnan(v)) else pd.Timestamp(v) for v in raw[c]]
     if "Major" in raw.columns:
         raw["Major"] = raw["Major"].astype(str).eq("True")

@@ -278,6 +278,8 @@ def present(raw: pd.DataFrame, show_val: bool) -> pd.DataFrame:
         row["Chart"] = f"https://www.tradingview.com/chart/?symbol={rec['Symbol'].replace('.', '-')}"
         row["_n_up"] = sum(not _nn(v) for v in ups.values())
         row["_has_dn"] = any(not _nn(v) for v in dns.values())
+        row["_clear_at"] = rec.get("dn_clear_at")
+        row["_prev4"], row["_prev1"] = rec.get("dn_prev_4H"), rec.get("dn_prev_1H")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -293,8 +295,12 @@ def in_universe(raw: pd.DataFrame) -> pd.DataFrame:
     return raw[idx_ok & cap_ok]
 
 
+def visible(df: pd.DataFrame) -> pd.DataFrame:
+    return df.drop(columns=[c for c in df.columns if c.startswith("_")])
+
+
 def show_table(df: pd.DataFrame, key: str):
-    st.dataframe(df.drop(columns=["_n_up", "_has_dn"]), hide_index=True, width="stretch", key=key,
+    st.dataframe(visible(df), hide_index=True, width="stretch", key=key,
                  column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="TradingView"),
                                 "Name": st.column_config.TextColumn("Name", width="medium"),
                                 "Index": st.column_config.TextColumn("Index", width="small",
@@ -304,7 +310,8 @@ def show_table(df: pd.DataFrame, key: str):
 
 custom_params = (hp != HeadParams()) or int(ema_len) != 89
 
-tab_scan, tab_check, tab_cmp = st.tabs(["🔍 สแกนหุ้น", "🧪 ตรวจสอบรายตัว", "📋 เทียบกับ TradingView"])
+tab_scan, tab_watch, tab_check, tab_cmp = st.tabs(
+    ["🔍 สแกนหุ้น", "⭐ Watchlist", "🧪 ตรวจสอบรายตัว", "📋 เทียบกับ TradingView"])
 
 # =====================================================================
 with tab_scan:
@@ -444,8 +451,71 @@ with tab_scan:
                     st.caption(f"ซ่อนหุ้นที่มีหัว Fibo ขาลง {len(dn):,} ตัว")
             out = res.copy()
             out.insert(0, "กลุ่ม", np.where(out["_has_dn"], "มีหัว Fibo ขาลง", "ไม่มีหัว Fibo ขาลง"))
-            st.download_button("⬇️ ดาวน์โหลด CSV", out.drop(columns=["_n_up", "_has_dn"])
+            st.download_button("⬇️ ดาวน์โหลด CSV", visible(out)
                                .to_csv(index=False).encode("utf-8-sig"), "scan_result.csv", "text/csv")
+
+
+def ago(t: pd.Timestamp, now: pd.Timestamp) -> str:
+    sec = max((now - t).total_seconds(), 0)
+    d, h = int(sec // 86400), int(sec % 86400 // 3600)
+    return f"{d} วัน {h} ชม." if d else (f"{h} ชม." if h else f"{int(sec // 60)} นาที")
+
+
+WL_MAX = 100
+WITHIN = {"ทั้งหมด": None, "24 ชม.": 24, "3 วัน": 72, "7 วัน": 168, "30 วัน": 720}
+
+# =====================================================================
+with tab_watch:
+    st.markdown("หุ้นที่ **เพิ่งเปลี่ยนกลุ่ม** จาก 🔴 มีหัว Fibo ขาลง (4H หรือ 1H) → 🟢 ไม่มีหัว Fibo ขาลง "
+                f"เรียงจากล่าสุด (สูงสุด {WL_MAX} ตัว) · ใช้ผลสแกนและเงื่อนไข (ดัชนี / market cap / EMA / หัวขาขึ้น) "
+                "เดียวกับหน้า 🔍 สแกนหุ้น")
+    if raw_view is None:
+        st.info("ยังไม่มีผลสแกน — เปิดผลสแกนอัตโนมัติ หรือกดสแกนสดที่หน้า 🔍 สแกนหุ้น ก่อน")
+    elif not scanner.has_watchlist(raw_view):
+        st.info("ผลสแกนนี้ยังไม่มีข้อมูลเวลาเปลี่ยนกลุ่ม (รูปแบบเก่า) — ไปที่ GitHub **Actions → Auto scan → "
+                "Run workflow** หรือกดสแกนสดใหม่")
+    else:
+        w1, w2 = st.columns([1, 1])
+        within = w1.selectbox("เปลี่ยนกลุ่มภายใน", list(WITHIN), index=0)
+        show_val_w = w2.toggle("แสดงราคาหัว Fibo", False, key="wl_val")
+        res_w = present(raw_view, show_val_w)
+        if res_w.empty:
+            wl = res_w
+        else:
+            wl = res_w[~res_w["_has_dn"] & res_w["_clear_at"].notna()].copy()
+        now_utc = pd.Timestamp.now(tz="UTC")
+        if not wl.empty:
+            wl["_t"] = pd.to_datetime(wl["_clear_at"], utc=True)
+            if WITHIN[within]:
+                wl = wl[wl["_t"] >= now_utc - pd.Timedelta(hours=WITHIN[within])]
+            wl = wl.sort_values("_t", ascending=False).head(WL_MAX)
+        m = st.columns(3)
+        m[0].metric("ใน Watchlist", f"{len(wl):,}")
+        if not wl.empty:
+            m[1].metric("เปลี่ยนล่าสุด", wl["_t"].iloc[0].tz_convert("Asia/Bangkok").strftime("%d/%m %H:%M"))
+            m[2].metric("ภายใน 24 ชม.", int((wl["_t"] >= now_utc - pd.Timedelta(hours=24)).sum()))
+        st.caption(f"ข้อมูลจาก {meta_view['src']} เมื่อ {meta_view['when']:%d %b %Y %H:%M} (เวลาไทย) · "
+                   "เวลาเปลี่ยนกลุ่ม = เวลาปิดแท่ง (4H หรือ 1H) แรกที่ไม่มีหัว Fibo ขาลงเหลือทั้งสอง TF")
+        if wl.empty:
+            st.warning("ยังไม่มีหุ้นที่เปลี่ยนกลุ่มตามเงื่อนไขนี้")
+        else:
+            disp = pd.DataFrame({
+                "เปลี่ยนกลุ่มเมื่อ (เวลาไทย)": wl["_t"].dt.tz_convert("Asia/Bangkok").dt.strftime("%d/%m/%Y %H:%M"),
+                "ผ่านมา": [ago(t, now_utc) for t in wl["_t"]],
+            })
+            for c in ["Symbol", "Name", "Index", "Sector", "MktCap (B)", "Price", EMA_COL, f"% จาก {EMA_COL}",
+                      UP_COLS["4H"], UP_COLS["1H"]]:
+                disp[c] = wl[c].values
+            disp["หัว Fibo ขาลงที่หายไป"] = [
+                " · ".join(f"{tf} {v:,.2f}" for tf, v in (("4H", a), ("1H", b)) if not _nn(v)) or "-"
+                for a, b in zip(wl["_prev4"], wl["_prev1"])]
+            disp["Chart"] = wl["Chart"].values
+            st.dataframe(disp, hide_index=True, width="stretch", key="t_watch",
+                         column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="TradingView"),
+                                        "Name": st.column_config.TextColumn("Name", width="medium"),
+                                        "Index": st.column_config.TextColumn("Index", width="small")})
+            st.download_button("⬇️ ดาวน์โหลด Watchlist (CSV)", disp.to_csv(index=False).encode("utf-8-sig"),
+                               "watchlist.csv", "text/csv")
 
 
 def head_detail(df: pd.DataFrame) -> dict:

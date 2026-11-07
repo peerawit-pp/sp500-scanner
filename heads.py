@@ -394,3 +394,46 @@ def heads_last(df: pd.DataFrame | None, hp: HeadParams) -> tuple[float, float]:
     if df is None or len(df) < hp.k_len + hp.smooth + 2:
         return NA, NA
     return float(head_latch_low(df, hp)[-1]), float(head_latch_high(df, hp)[-1])
+
+
+# ---------- Watchlist: เวลาที่ "มีหัว Fibo ขาลง (4H หรือ 1H)" เปลี่ยนเป็น "ไม่มีหัว Fibo ขาลง" ----------
+def _ends(idx: pd.DatetimeIndex, tf: str) -> np.ndarray:
+    """เวลาปิดแท่ง (UTC ns) ของแต่ละแท่ง"""
+    from fibo import bar_end
+    ny = idx.tz_localize("America/New_York") if idx.tz is None else idx.tz_convert("America/New_York")
+    return np.array([bar_end(t, tf).value for t in ny], dtype="int64")
+
+
+def heads_with_clear(df1h: pd.DataFrame | None, df4h: pd.DataFrame | None, hp: HeadParams) -> dict:
+    """
+    หัว Fibo ล่าสุดของ 4H / 1H + เวลาที่กลุ่มเปลี่ยนจาก "มีหัวขาลง" -> "ไม่มีหัวขาลง" ครั้งล่าสุด
+    ไล่ตามเวลาปิดแท่ง 1H ทุกแท่ง: สถานะ = หัวขาลง 1H ของแท่งนั้น หรือ หัวขาลง 4H ของแท่ง 4H ล่าสุดที่ปิดแล้ว ณ เวลานั้น
+    clear_at = เวลาปิดแท่งแรกที่ไม่มีหัวขาลงทั้งสอง TF (และยังไม่มีจนถึงปัจจุบัน) — None ถ้ายังมีหัวขาลงอยู่
+               หรือในช่วงข้อมูลไม่เคยมีหัวขาลงเลย
+    """
+    out = {"4H_up": NA, "4H_dn": NA, "1H_up": NA, "1H_dn": NA,
+           "dn_clear_at": None, "dn_prev_4H": NA, "dn_prev_1H": NA}
+    ok = lambda d: d is not None and len(d) >= hp.k_len + hp.smooth + 2   # noqa: E731
+    up1 = dn1 = up4 = dn4 = None
+    if ok(df1h):
+        up1, dn1 = head_latch_low(df1h, hp), head_latch_high(df1h, hp)
+        out["1H_up"], out["1H_dn"] = float(up1[-1]), float(dn1[-1])
+    if ok(df4h):
+        up4, dn4 = head_latch_low(df4h, hp), head_latch_high(df4h, hp)
+        out["4H_up"], out["4H_dn"] = float(up4[-1]), float(dn4[-1])
+    if dn1 is None:
+        return out
+    t1 = _ends(df1h.index, "1H")
+    dn4_at = np.full(len(t1), np.nan)
+    if dn4 is not None:
+        t4 = _ends(df4h.index, "4H")
+        j = np.searchsorted(t4, t1, side="right") - 1          # แท่ง 4H ล่าสุดที่ปิดแล้ว ณ เวลาปิดแท่ง 1H
+        valid = j >= 0
+        dn4_at[valid] = dn4[j[valid]]
+    has = ~np.isnan(dn1) | ~np.isnan(dn4_at)
+    if has[-1] or not has.any():
+        return out
+    k = int(np.flatnonzero(has)[-1])                            # แท่งสุดท้ายที่ยังมีหัวขาลง
+    out["dn_clear_at"] = pd.Timestamp(int(t1[k + 1]), tz="UTC").tz_convert("America/New_York")
+    out["dn_prev_4H"], out["dn_prev_1H"] = float(dn4_at[k]), float(dn1[k])
+    return out
