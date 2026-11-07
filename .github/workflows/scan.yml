@@ -1,0 +1,61 @@
+name: Auto scan
+
+on:
+  schedule:
+    - cron: "50 17,18 * * 1-5"
+    - cron: "20 20,21 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install pandas numpy requests yfinance
+
+      - name: Restore price cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .price_cache
+          key: price-cache-${{ github.run_id }}
+          restore-keys: price-cache-
+
+      - name: Scan
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          MIN_CAP_B: "10"
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: python scan_job.py
+
+      - name: Save price cache
+        uses: actions/cache/save@v4
+        with:
+          path: .price_cache
+          key: price-cache-${{ github.run_id }}
+
+      - name: Commit results
+        run: |
+          git config user.name "auto-scan-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/
+          if git diff --cached --quiet; then
+            echo "no new results"
+          else
+            git commit -m "auto scan $(date -u +%Y-%m-%d_%H%M)"
+            git push
+          fi
