@@ -164,9 +164,9 @@ class AlpacaError(Exception):
 
 
 class _RateLimiter:
-    """จำกัดจำนวนคำขอต่อนาที (แผนฟรี 200/นาที — ใช้ 180 เผื่อไว้)"""
+    """จำกัดจำนวนคำขอต่อนาที (แผนฟรี 200/นาที — ใช้ 190 เผื่อไว้)"""
 
-    def __init__(self, per_min: int = 180):
+    def __init__(self, per_min: int = 190):
         self.gap = 60.0 / per_min
         self.lock = threading.Lock()
         self.next_t = 0.0
@@ -295,22 +295,63 @@ def daily_to_monthly(d: pd.DataFrame) -> pd.DataFrame:
     return _agg(d, "MS")
 
 
-def alpaca_download(tickers: list[str], interval: str, key: str, secret: str,
-                    progress=None) -> dict[str, pd.DataFrame]:
-    """interval: 1h / 1d (1wk, 1mo ให้รวมจาก 1d ด้วย daily_to_weekly / daily_to_monthly)"""
+def _alpaca_fetch(tickers: list[str], interval: str, key: str, secret: str, start: pd.Timestamp,
+                  progress=None, group: int = 20) -> dict[str, pd.DataFrame]:
     to_alp = {t: t.replace("-", ".") for t in tickers}          # BRK-B -> BRK.B
     back = {v: k for k, v in to_alp.items()}
-    now = pd.Timestamp.now(tz=NY)
     if interval == "1h":
-        conv = alpaca_bars(list(to_alp.values()), "30Min", now - pd.Timedelta(days=INTRADAY_DAYS), key, secret,
+        conv = alpaca_bars(list(to_alp.values()), "30Min", start, key, secret, group=group,
                            session_only=True, finish=session_1h, progress=progress)
     elif interval == "1d":
         def _norm(df):
             df = df.copy()
             df.index = df.index.normalize()                     # วันที่ (เที่ยงคืน NY)
             return df
-        conv = alpaca_bars(list(to_alp.values()), "1Day", now - pd.DateOffset(years=DAILY_YEARS), key, secret,
+        conv = alpaca_bars(list(to_alp.values()), "1Day", start, key, secret, group=group,
                            finish=_norm, progress=progress)
     else:
         raise ValueError(interval)
     return {back.get(s, s): df for s, df in conv.items() if not df.empty}
+
+
+def _window_start(interval: str) -> pd.Timestamp:
+    now = pd.Timestamp.now(tz=NY)
+    return now - pd.Timedelta(days=INTRADAY_DAYS) if interval == "1h" else now - pd.DateOffset(years=DAILY_YEARS)
+
+
+def alpaca_download(tickers: list[str], interval: str, key: str, secret: str,
+                    progress=None) -> dict[str, pd.DataFrame]:
+    """interval: 1h / 1d (1wk, 1mo ให้รวมจาก 1d ด้วย daily_to_weekly / daily_to_monthly)"""
+    return _alpaca_fetch(tickers, interval, key, secret, _window_start(interval), progress)
+
+
+def alpaca_update(tickers: list[str], interval: str, key: str, secret: str,
+                  cached: dict[str, pd.DataFrame] | None, progress=None) -> dict[str, pd.DataFrame]:
+    """
+    อัปเดตแบบเพิ่มเฉพาะส่วนใหม่ (incremental):
+      - หุ้นที่มีข้อมูลเดิม -> ดึงตั้งแต่ต้นวันของแท่งล่าสุด (1h) / ย้อน 7 วัน (1d) แล้วต่อท้ายข้อมูลเดิม
+      - หุ้นใหม่หรือข้อมูลเก่าเกินไป -> ดึงเต็มช่วง
+    """
+    cached = cached or {}
+    lasts = {t: cached[t].index[-1] for t in tickers if t in cached and not cached[t].empty}
+    if not lasts:
+        return alpaca_download(tickers, interval, key, secret, progress)
+    med = pd.Series(list(lasts.values())).sort_values().iloc[len(lasts) // 2]
+    start = med.normalize() if interval == "1h" else med.normalize() - pd.Timedelta(days=7)
+    inc = [t for t, lt in lasts.items() if lt >= start]
+    full = [t for t in tickers if t not in inc]
+    out: dict[str, pd.DataFrame] = {}
+    if inc:
+        new = _alpaca_fetch(inc, interval, key, secret, start, progress, group=100)
+        w0 = _window_start(interval)
+        for t in inc:
+            old = cached[t]
+            if t in new:
+                df = pd.concat([old[old.index < start], new[t]])
+                df = df[~df.index.duplicated(keep="last")].sort_index()
+            else:
+                df = old
+            out[t] = df[df.index >= w0]
+    if full:
+        out.update(alpaca_download(full, interval, key, secret, progress))
+    return out
