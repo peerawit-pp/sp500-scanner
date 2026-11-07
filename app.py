@@ -1,10 +1,12 @@
 """
-S&P 500 Multi-TF Scanner — Higher Low + Price > X บน 4H / D / W  +  MTF EMA89 4H
+US Stock Multi-TF Scanner (S&P 500 / NASDAQ 100 / Dow 30 / NASDAQ Composite) — Higher Low + Price > X บน 4H / D / W  +  MTF EMA89 4H
 ลอจิกแปลงจาก Pine:
   - "Reversal Candle [Stoch Oversold]"                      -> logic.py  (Higher Low + Price > X)
   - "Reversal Candle [Stoch Oversold] Fibo New ver7 + EMA89" -> fibo.py   (EMA89 MTF + Fibo Support)
 รัน:  streamlit run app.py
 """
+import time
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,8 +16,8 @@ import data
 from fibo import FIB_LEVELS, drop_unclosed, fibo_levels, last_bar_closed, mtf_ema
 from logic import Params, ema, hl_engine, resample_4h, tf_state
 
-st.set_page_config(page_title="S&P 500 Multi-TF Scanner", page_icon="📈", layout="wide")
-st.title("📈 S&P 500 Scanner — Higher Low (4H / D / W) + EMA89 4H")
+st.set_page_config(page_title="US Stock Multi-TF Scanner", page_icon="📈", layout="wide")
+st.title("📈 US Stock Scanner — Higher Low (4H / D / W) + EMA89 4H")
 st.caption("ลอจิกจาก Reversal Candle [Stoch Oversold] + MTF EMA89 4H · ราคาจาก Alpaca (SIP ดีเลย์ 15 นาที) "
            "หรือ Yahoo Finance · ใช้ประกอบการตัดสินใจเท่านั้น ยืนยันกราฟบน TradingView ก่อนเข้า order")
 
@@ -34,12 +36,9 @@ def _secret(name: str) -> str:
 
 
 # ---------- cache ----------
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def get_universe():
-    df = data.sp500_list()
-    caps = data.market_caps(df["Yahoo"].tolist())
-    df["MarketCapB"] = df["Yahoo"].map(caps) / 1e9
-    return df
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def get_universe(indexes: tuple) -> pd.DataFrame:
+    return data.universe(list(indexes))
 
 
 @st.cache_data(ttl=15 * 60, show_spinner=False)
@@ -47,19 +46,42 @@ def _yahoo(tickers: tuple, interval: str):
     return data.download(list(tickers), interval, SRC[interval])
 
 
-@st.cache_data(ttl=15 * 60, show_spinner=False)
-def _alpaca(tickers: tuple, interval: str, key_id: str, _secret_key: str):
+PRICE_TTL = 15 * 60
+
+
+@st.cache_resource
+def _price_cache() -> dict:
+    """cache ราคา Alpaca ร่วมกันทุก session: {(interval, tickers, key_id): (เวลา, data)}"""
+    return {}
+
+
+def _alpaca(tickers: tuple, interval: str, key_id: str, secret_key: str, progress=None):
+    cache, now = _price_cache(), time.time()
+    for k in [k for k, (t0, _) in cache.items() if now - t0 > PRICE_TTL]:
+        cache.pop(k, None)                                   # ล้างของหมดอายุ
+    hit = cache.get((interval, tickers, key_id))
+    if hit:
+        return hit[1]
+    want = set(tickers)                                      # ใช้ข้อมูลจากการสแกนที่ครอบคลุมอยู่แล้ว
+    for (itv, tks, kid), (_, res) in list(cache.items()):
+        if itv == interval and kid == key_id and want <= set(tks):
+            return {t: res[t] for t in tickers if t in res}
     if interval in ("1h", "1d"):
-        return data.alpaca_download(list(tickers), interval, key_id, _secret_key)
-    d = _alpaca(tickers, "1d", key_id, _secret_key)
-    f = data.daily_to_weekly if interval == "1wk" else data.daily_to_monthly
-    return {t: f(df) for t, df in d.items()}
+        res = data.alpaca_download(list(tickers), interval, key_id, secret_key, progress=progress)
+    else:
+        d = _alpaca(tickers, "1d", key_id, secret_key, progress)
+        f = data.daily_to_weekly if interval == "1wk" else data.daily_to_monthly
+        res = {t: f(df) for t, df in d.items()}
+    for k in [k for k in cache if k[0] == interval and k[2] == key_id and set(k[1]) <= want]:
+        cache.pop(k, None)                                   # ชุดเล็กที่อยู่ในชุดใหม่แล้ว ไม่ต้องเก็บซ้ำ (ประหยัด RAM)
+    cache[(interval, tickers, key_id)] = (time.time(), res)
+    return res
 
 
-def get_prices(tickers: tuple, interval: str):
+def get_prices(tickers: tuple, interval: str, progress=None):
     if source == ALPACA:
         try:
-            return _alpaca(tickers, interval, alp_key, alp_secret)
+            return _alpaca(tickers, interval, alp_key, alp_secret, progress)
         except data.AlpacaError as e:
             st.error(f"{e}\n\nตรวจสอบ API Key / Secret ของ Alpaca แล้วลองใหม่ หรือเปลี่ยนไปใช้ Yahoo ชั่วคราว")
             st.stop()
@@ -96,12 +118,25 @@ with st.sidebar:
             st.caption("ใส่ไว้ใน Secrets ของ Streamlit จะได้ไม่ต้องกรอกทุกครั้ง (ดู README)")
     need_keys = source == ALPACA and not (alp_key and alp_secret)
 
+    st.subheader("📊 ดัชนี")
+    sel_idx = st.multiselect("หุ้นในดัชนี", data.INDEXES, default=data.INDEXES, label_visibility="collapsed")
+
     st.subheader("Market cap (พันล้าน USD)")
     c1, c2 = st.columns(2)
-    cap_min = c1.number_input("ขั้นต่ำ (B)", 0.0, 10000.0, 5.0, step=1.0)
+    cap_min = c1.number_input("ขั้นต่ำ (B)", 0.0, 10000.0, 10.0, step=1.0)
     cap_max = c2.number_input("สูงสุด (B)", 0.0, 10000.0, 10000.0, step=10.0)
-    cap_unknown = st.checkbox("รวมหุ้นที่ดึง market cap ไม่ได้", True,
-                              help="market cap ดึงจาก Yahoo ถ้าโดนจำกัดจะยังสแกนหุ้นเหล่านั้นต่อ")
+    cap_unknown = st.checkbox("รวมหุ้นใน S&P / NDX / Dow ที่ไม่มีข้อมูล market cap", True,
+                              help="หุ้นใน NASDAQ Composite ที่ไม่มี market cap (ส่วนใหญ่เป็นกองทุน/หุ้นจิ๋ว) จะถูกตัดออกเสมอ")
+
+    uni_all = get_universe(tuple(sel_idx)) if sel_idx else pd.DataFrame(columns=["MarketCapB", "Major", "Yahoo"])
+    in_range = (uni_all["MarketCapB"] >= cap_min) & (uni_all["MarketCapB"] <= cap_max)
+    uni_sel = uni_all[in_range | (uni_all["MarketCapB"].isna() & uni_all["Major"].astype(bool) & cap_unknown)]
+    est_min = len(uni_sel) / 494 * (2.5 if source == ALPACA else 3.0)
+    st.caption(f"รวม {len(uni_all):,} ตัว → ผ่าน market cap **{len(uni_sel):,} ตัว** "
+               f"· สแกนครั้งแรกประมาณ {max(est_min, 0.3):.0f} นาที")
+    if len(uni_sel) > 1200:
+        st.warning("หุ้นเยอะมาก จะใช้เวลานานและอาจใช้ RAM เกินแผนฟรีของ Streamlit "
+                   "แนะนำเพิ่ม market cap ขั้นต่ำ (เช่น 2B ขึ้นไป)")
 
     st.subheader("Higher Low / Price vs X")
     sel_tfs = st.multiselect("TF ที่ใช้คัด", TFS, default=TFS)
@@ -148,6 +183,12 @@ def latest_price(fr: dict) -> float:
             if not d.empty:
                 return float(d["Close"].iloc[-1])
     return NAN
+
+
+def fmt_dt(ts, tf: str):
+    if ts is None or (isinstance(ts, float) and ts != ts):
+        return None
+    return pd.Timestamp(ts).strftime("%d/%m/%Y %H:%M" if tf in ("4H", "1H") else "%d/%m/%Y")
 
 
 def tick(v) -> str:
@@ -204,29 +245,27 @@ def tf_rows(sym: str, fr: dict) -> list[dict]:
             "Previous SW": r2(s["prev"]), "SW Low": r2(s["sw"]), "Higher Low": tick(s["hl"]),
             "X": r2(s["x"]), "Price vs X": tick(s["px"]),
             "Close (TF)": None if d is None else r2(d["Close"].iloc[-1]),
-            "Alert ล่าสุด": None if s["alert_date"] is None else s["alert_date"].strftime("%d/%m/%Y %H:%M"),
+            "Alert ล่าสุด": fmt_dt(s["alert_date"], tf),
             f"EMA{p.ema_len} 4H": (None if e4 != e4 else f"{'✅' if price > e4 else '❌'} {e4:,.2f}") if tf == "4H" else "",
         })
     return rows
 
 
-tab_scan, tab_check, tab_cmp = st.tabs(["🔍 สแกน S&P 500", "🧪 ตรวจสอบรายตัว", "📋 เทียบกับ TradingView"])
+tab_scan, tab_check, tab_cmp = st.tabs(["🔍 สแกนหุ้น", "🧪 ตรวจสอบรายตัว", "📋 เทียบกับ TradingView"])
 
 # =====================================================================
 with tab_scan:
     if need_keys:
         st.warning("ใส่ Alpaca API Key / Secret ที่แถบซ้ายก่อน (หรือเลือก Yahoo Finance)")
-    run = st.button("🔍 สแกน S&P 500", type="primary", disabled=not sel_tfs or need_keys)
+    if not sel_idx:
+        st.warning("เลือกดัชนีอย่างน้อย 1 ตัวที่แถบซ้าย")
+    run = st.button(f"🔍 สแกน {len(uni_sel):,} ตัว", type="primary",
+                    disabled=not sel_tfs or need_keys or uni_sel.empty)
     if run:
         with st.status("กำลังสแกน...", expanded=True) as status:
-            st.write("โหลดรายชื่อ S&P 500 + market cap (ครั้งแรก 1–3 นาที)")
-            uni_all = get_universe()
-            n_nocap = int(uni_all["MarketCapB"].isna().sum())
-            in_range = (uni_all["MarketCapB"] >= cap_min) & (uni_all["MarketCapB"] <= cap_max)
-            uni = uni_all[in_range | (uni_all["MarketCapB"].isna() & cap_unknown)]
+            uni = uni_sel
             tickers = tuple(uni["Yahoo"])
-            st.write(f"ผ่านเงื่อนไข market cap: {len(tickers)} ตัว"
-                     + (f" (ดึง market cap ไม่ได้ {n_nocap} ตัว)" if n_nocap else ""))
+            st.write(f"ดัชนี: {', '.join(sel_idx)} · ผ่านเงื่อนไข market cap: {len(tickers):,} ตัว")
 
             need = {"1h", "1d", "1wk"}
             if show_fibo and FIBO_TF[fibo_src] == "M":
@@ -234,9 +273,18 @@ with tab_scan:
             store, load_rep = {}, {}
             for itv in ["1h", "1d", "1wk", "1mo"]:
                 if itv in need:
-                    st.write(f"โหลดราคา {itv} จาก {source} "
-                             + ("(ครั้งแรกประมาณ 1–3 นาที)" if itv in ("1h", "1d") else ""))
-                    store[itv] = get_prices(tickers, itv)
+                    t0 = time.time()
+                    label = f"โหลดราคา {itv} จาก {source}"
+                    pb = st.progress(0.0, text=label)
+
+                    def _prog(done, total, pb=pb, label=label, t0=t0):
+                        el = time.time() - t0
+                        eta = el / done * (total - done)
+                        pb.progress(done / total, text=f"{label} · {done}/{total} กลุ่ม · "
+                                                       f"ผ่านไป {el:.0f} วิ · เหลือราว {eta:.0f} วิ")
+
+                    store[itv] = get_prices(tickers, itv, _prog)
+                    pb.progress(1.0, text=f"{label} · เสร็จใน {time.time() - t0:.0f} วิ")
                     load_rep[itv] = (len(store[itv]), sorted(set(tickers) - set(store[itv])))
                     st.write(f"→ ได้ {load_rep[itv][0]}/{len(tickers)} ตัว")
 
@@ -257,7 +305,7 @@ with tab_scan:
                 if not ok:
                     continue
                 row = {
-                    "Symbol": r["Symbol"], "Name": r["Name"], "Sector": r["Sector"],
+                    "Symbol": r["Symbol"], "Name": r["Name"], "Index": r["Index"], "Sector": r["Sector"],
                     "MktCap (B)": r2(r["MarketCapB"]), "Price": r2(price),
                     f"EMA{p.ema_len} 4H": None if e4 != e4 else f"{'✅' if above else '❌'} {e4:,.2f}",
                     "% จาก EMA": r2((price / e4 - 1) * 100) if e4 == e4 else None,
@@ -267,7 +315,7 @@ with tab_scan:
                     s = sts[tf]
                     row[f"{tf} Higher Low"] = tick(s["hl"])
                     row[f"{tf} Price vs X"] = tick(s["px"])
-                    row[f"{tf} Alert"] = s["alert_date"]
+                    row[f"{tf} Alert"] = fmt_dt(s["alert_date"], tf)
                     row[f"{tf} X"] = r2(s["x"])
                     row[f"{tf} % ถึง X"] = r2((s["x"] / price - 1) * 100)
                     row[f"{tf} SW Low"] = r2(s["sw"])
@@ -286,21 +334,21 @@ with tab_scan:
                 rows.append(row)
             st.session_state["results"] = pd.DataFrame(rows)
             st.session_state["meta"] = (len(tickers), sel_tfs, match_mode, pd.Timestamp.now(tz="Asia/Bangkok"),
-                                        source, load_rep)
+                                        source, load_rep, list(sel_idx))
             status.update(label="สแกนเสร็จ", state="complete", expanded=False)
 
     if "results" not in st.session_state:
-        st.info("ตั้งเงื่อนไขทางซ้าย แล้วกด **สแกน S&P 500**")
+        st.info("เลือกดัชนีและตั้งเงื่อนไขทางซ้าย แล้วกดปุ่ม **สแกน**")
     else:
         res = st.session_state["results"]
-        n, tfs_used, mode, when, src_used, load_rep = st.session_state["meta"]
+        n, tfs_used, mode, when, src_used, load_rep, idx_used = st.session_state["meta"]
         m = st.columns(5)
         m[0].metric("สแกนทั้งหมด", n)
         m[1].metric("เข้าเงื่อนไข", len(res))
         for col, tf in zip(m[2:], TFS):
             both = ((res[f"{tf} Higher Low"] == "✅") & (res[f"{tf} Price vs X"] == "✅")).sum() if not res.empty else 0
             col.metric(f"{tf}  HL ✅ X ✅", int(both))
-        st.caption(f"TF: {', '.join(tfs_used)} ({mode}) · ราคาจาก {src_used} · "
+        st.caption(f"ดัชนี: {', '.join(idx_used)} · TF: {', '.join(tfs_used)} ({mode}) · ราคาจาก {src_used} · "
                    f"สแกนเมื่อ {when:%d %b %Y %H:%M} (เวลาไทย)")
         missing = {itv: miss for itv, (_, miss) in load_rep.items() if miss}
         if missing:
@@ -363,7 +411,7 @@ with tab_check:
                 dash.append({
                     "TF": tf, "Previous SW": r2(s["prev"]), "SW Low": r2(s["sw"]),
                     "Higher Low": tick(s["hl"]), "X": r2(s["x"]), "Price vs X": tick(s["px"]),
-                    "Close (TF)": r2(last["Close"]), "Alert ล่าสุด": s["alert_date"],
+                    "Close (TF)": r2(last["Close"]), "Alert ล่าสุด": fmt_dt(s["alert_date"], tf),
                     "%K": r2(last["k"]), "Oversold": "🔴" if last["isOS"] else "",
                 })
             st.dataframe(pd.DataFrame(dash), hide_index=True, width="stretch")
@@ -383,13 +431,15 @@ with tab_check:
 
             df, r = engines[ctf]
             ev = r[r["alert"]].copy()
-            ev["SW Low date"] = [df.index[int(b)] if b >= 0 else None for b in ev["sw_bar"]]
+            ev["SW Low date"] = [fmt_dt(df.index[int(b)], ctf) if b >= 0 else None for b in ev["sw_bar"]]
             st.subheader(f"ประวัติ Alert {ctf} 'Higher Low ✅ + Price > X ✅' ({len(ev)} ครั้ง)")
             tbl = ev[["Close", "prev_sw", "sw", "SW Low date", "x_live"]].rename(
                 columns={"prev_sw": "Previous SW", "sw": "SW Low", "x_live": "X"})
             num = ["Close", "Previous SW", "SW Low", "X"]
             tbl[num] = tbl[num].round(2)
-            st.dataframe(tbl.sort_index(ascending=False).head(30), width="stretch")
+            tbl = tbl.sort_index(ascending=False).head(30)
+            tbl.insert(0, "Alert เมื่อ", [fmt_dt(t, ctf) for t in tbl.index])
+            st.dataframe(tbl, hide_index=True, width="stretch")
 
             show = df.tail(250)
             rr = r.loc[show.index]

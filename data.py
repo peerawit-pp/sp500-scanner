@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -28,13 +28,21 @@ NY = "America/New_York"
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 ALPACA_BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
-INTRADAY_DAYS = 300      # ประวัติ 1H/4H จาก Alpaca (~410 แท่ง 4H)
-DAILY_YEARS = 10         # ประวัติ D/W/M จาก Alpaca
+INTRADAY_DAYS = 250      # ประวัติ 1H/4H จาก Alpaca (~340 แท่ง 4H)
+DAILY_YEARS = 6          # ประวัติ D/W/M จาก Alpaca (W ~310 แท่ง)
 
 
 # =====================================================================
-# รายชื่อ + market cap
+# รายชื่อหุ้นตามดัชนี + market cap + sector
 # =====================================================================
+INDEXES = ["S&P 500", "NASDAQ 100", "Dow Jones 30", "NASDAQ Composite"]
+LISTING_URL = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/{ex}/{ex}_full_tickers.json"
+_NOT_COMMON = (r"\b(?:Warrants?|Units?|Rights?|Preferred|Notes due|Debentures?|Fund|ETF|"
+               r"Depositary Shares, each representing a)\b")
+_NAME_TAIL = (r"\s+(?:Class [A-Z]\s+)?(?:Common Stock|Ordinary Shares?|Common Shares|"
+              r"American Depositary Shares?|ADS|Depositary Shares?)\b.*$")
+
+
 def sp500_list() -> pd.DataFrame:
     try:
         df = pd.read_csv(CSV_URL)
@@ -45,17 +53,73 @@ def sp500_list() -> pd.DataFrame:
     return df[["Symbol", "Yahoo", "Name", "Sector"]]
 
 
+def us_listings() -> pd.DataFrame:
+    """หุ้นที่จดทะเบียนใน NASDAQ / NYSE / AMEX พร้อม market cap และ sector (ข้อมูลจาก Nasdaq, อัปเดตรายวัน)"""
+    try:
+        recs = []
+        for ex in ("nasdaq", "nyse", "amex"):
+            r = requests.get(LISTING_URL.format(ex=ex), timeout=30)
+            r.raise_for_status()
+            recs += [{"Symbol": x["symbol"], "Name": x["name"], "Sector": x["sector"],
+                      "MarketCap": x["marketCap"], "Exchange": ex.upper()} for x in r.json()]
+        df = pd.DataFrame(recs)
+        if len(df) < 3000:
+            raise ValueError("listing too small")
+    except Exception:
+        df = pd.read_csv(HERE / "us_listings_fallback.csv")
+    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.replace("/", ".", regex=False)   # BRK/B -> BRK.B
+    df["MarketCapB"] = pd.to_numeric(df["MarketCap"], errors="coerce") / 1e9
+    df.loc[df["MarketCapB"] <= 0, "MarketCapB"] = float("nan")
+    df["Name"] = df["Name"].astype(str)
+    df["Sector"] = df["Sector"].fillna("").replace("", "Other")
+    return df.drop_duplicates("Symbol")[["Symbol", "Name", "Sector", "MarketCapB", "Exchange"]]
+
+
+def universe(selected: list[str]) -> pd.DataFrame:
+    """รวมรายชื่อหุ้นจากดัชนีที่เลือก -> Symbol, Yahoo, Name, Sector, MarketCapB, Index, Major"""
+    lst = us_listings().set_index("Symbol")
+    members: dict[str, list[str]] = {}
+    names, sectors = {}, {}
+    if "S&P 500" in selected:
+        sp = sp500_list()
+        for _, r in sp.iterrows():
+            members.setdefault(r["Symbol"], []).append("S&P 500")
+            names[r["Symbol"]], sectors[r["Symbol"]] = r["Name"], r["Sector"]
+    idx = pd.read_csv(HERE / "indices.csv")
+    for ix in ("NASDAQ 100", "Dow Jones 30"):
+        if ix in selected:
+            for s in idx.loc[idx["Index"] == ix, "Symbol"]:
+                members.setdefault(s, []).append(ix)
+    if "NASDAQ Composite" in selected:
+        nas = lst[(lst["Exchange"] == "NASDAQ")]
+        ok = ~nas.index.str.contains(r"[\^]", regex=True) & ~nas["Name"].str.contains(_NOT_COMMON, case=False, regex=True)
+        for s in nas.index[ok]:
+            members.setdefault(s, []).append("NASDAQ Composite")
+    rows = []
+    for s, ixs in members.items():
+        info = lst.loc[s] if s in lst.index else None
+        nm = names.get(s) or (None if info is None else
+                              pd.Series([info["Name"]]).str.replace(_NAME_TAIL, "", regex=True).iloc[0])
+        rows.append({"Symbol": s, "Yahoo": s.replace(".", "-"), "Name": nm or s,
+                     "Sector": sectors.get(s) or (None if info is None else info["Sector"]) or "Other",
+                     "MarketCapB": None if info is None else info["MarketCapB"],
+                     "Index": ", ".join(ixs),
+                     "Major": any(i != "NASDAQ Composite" for i in ixs)})
+    out = pd.DataFrame(rows, columns=["Symbol", "Yahoo", "Name", "Sector", "MarketCapB", "Index", "Major"])
+    out["MarketCapB"] = pd.to_numeric(out["MarketCapB"], errors="coerce")
+    return out.sort_values("Symbol").reset_index(drop=True)
+
+
 def _mcap(t: str) -> float | None:
     import yfinance as yf
-    for attempt in range(2):
-        try:
-            return float(yf.Ticker(t).fast_info["marketCap"])
-        except Exception:
-            time.sleep(0.5 * (attempt + 1))
-    return None
+    try:
+        return float(yf.Ticker(t).fast_info["marketCap"])
+    except Exception:
+        return None
 
 
 def market_caps(tickers: list[str]) -> dict[str, float | None]:
+    """(สำรอง) market cap จาก Yahoo ทีละตัว"""
     with ThreadPoolExecutor(max_workers=8) as ex:
         return dict(zip(tickers, ex.map(_mcap, tickers)))
 
@@ -116,8 +180,20 @@ class _RateLimiter:
             time.sleep(t - now)
 
 
-def _alpaca_fetch_group(syms, timeframe, start, end, limiter, headers, feed):
-    """ดึงหลาย symbol ในคำขอเดียว + ไล่ next_page_token จนครบ"""
+def _page_to_df(bars: list, session_only: bool) -> pd.DataFrame:
+    """แปลงแท่งจาก 1 หน้า -> DataFrame เล็ก (ตัด pre/post ทิ้งทันทีเพื่อประหยัด RAM)"""
+    df = pd.DataFrame.from_records(bars, columns=["t", "o", "h", "l", "c", "v"])
+    idx = pd.to_datetime(df["t"], utc=True).dt.tz_convert(NY)
+    df = df.drop(columns="t").set_axis(pd.DatetimeIndex(idx), axis=0)
+    df.columns = OHLCV
+    if session_only:
+        mins = df.index.hour * 60 + df.index.minute
+        df = df[(mins >= 570) & (mins < 960)]
+    return df
+
+
+def _alpaca_fetch_group(syms, timeframe, start, end, limiter, headers, feed, session_only, finish):
+    """ดึงหลาย symbol ในคำขอเดียว + ไล่ next_page_token จนครบ แล้วย่อข้อมูลทันที"""
     sess = requests.Session()           # 1 session ต่อ thread
     acc: dict[str, list] = {}
     token = None
@@ -147,35 +223,42 @@ def _alpaca_fetch_group(syms, timeframe, start, end, limiter, headers, feed):
             raise AlpacaError("Alpaca ไม่ตอบหลังลองซ้ำหลายครั้ง")
         js = r.json()
         for s, bars in (js.get("bars") or {}).items():
-            acc.setdefault(s, []).extend(bars)
+            if bars:
+                part = _page_to_df(bars, session_only)
+                if not part.empty:
+                    acc.setdefault(s, []).append(part)
         token = js.get("next_page_token")
         if not token:
-            return acc
+            break
+    out = {}
+    for s, parts in acc.items():
+        df = pd.concat(parts)
+        df = df[~df.index.duplicated()].sort_index()
+        df = finish(df) if finish else df
+        if not df.empty:
+            out[s] = df
+    return out
 
 
 def alpaca_bars(symbols: list[str], timeframe: str, start: pd.Timestamp, key: str, secret: str,
-                feed: str = "sip", group: int = 40, workers: int = 6) -> dict[str, pd.DataFrame]:
-    """คืน dict[alpaca_symbol -> DataFrame] index เป็นเวลา NY"""
+                feed: str = "sip", group: int = 20, workers: int = 6,
+                session_only: bool = False, finish=None, progress=None) -> dict[str, pd.DataFrame]:
+    """คืน dict[alpaca_symbol -> DataFrame] index เป็นเวลา NY
+    progress(done, total) ถูกเรียกจาก thread หลักทุกครั้งที่ดึงเสร็จ 1 กลุ่ม"""
     headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
     # แผนฟรี: ข้อมูล SIP ต้องมี end เก่ากว่า 15 นาที
     end = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
     start_s = start.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
     limiter = _RateLimiter()
     groups = [symbols[i:i + group] for i in range(0, len(symbols), group)]
-    acc: dict[str, list] = {}
+    out: dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for part in ex.map(lambda g: _alpaca_fetch_group(g, timeframe, start_s, end, limiter, headers, feed),
-                           groups):
-            for s, bars in part.items():
-                acc.setdefault(s, []).extend(bars)
-    out = {}
-    for s, bars in acc.items():
-        if not bars:
-            continue
-        df = pd.DataFrame(bars)
-        df.index = pd.to_datetime(df["t"], utc=True).dt.tz_convert(NY)
-        df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})[OHLCV]
-        out[s] = df[~df.index.duplicated()].sort_index()
+        futs = [ex.submit(_alpaca_fetch_group, g, timeframe, start_s, end, limiter, headers, feed,
+                          session_only, finish) for g in groups]
+        for done, f in enumerate(as_completed(futs), 1):
+            out.update(f.result())
+            if progress:
+                progress(done, len(groups))
     return out
 
 
@@ -212,21 +295,22 @@ def daily_to_monthly(d: pd.DataFrame) -> pd.DataFrame:
     return _agg(d, "MS")
 
 
-def alpaca_download(tickers: list[str], interval: str, key: str, secret: str) -> dict[str, pd.DataFrame]:
+def alpaca_download(tickers: list[str], interval: str, key: str, secret: str,
+                    progress=None) -> dict[str, pd.DataFrame]:
     """interval: 1h / 1d (1wk, 1mo ให้รวมจาก 1d ด้วย daily_to_weekly / daily_to_monthly)"""
     to_alp = {t: t.replace("-", ".") for t in tickers}          # BRK-B -> BRK.B
     back = {v: k for k, v in to_alp.items()}
     now = pd.Timestamp.now(tz=NY)
     if interval == "1h":
-        raw = alpaca_bars(list(to_alp.values()), "30Min", now - pd.Timedelta(days=INTRADAY_DAYS), key, secret)
-        conv = {s: session_1h(df) for s, df in raw.items()}
+        conv = alpaca_bars(list(to_alp.values()), "30Min", now - pd.Timedelta(days=INTRADAY_DAYS), key, secret,
+                           session_only=True, finish=session_1h, progress=progress)
     elif interval == "1d":
-        raw = alpaca_bars(list(to_alp.values()), "1Day", now - pd.DateOffset(years=DAILY_YEARS), key, secret)
-        conv = {}
-        for s, df in raw.items():
+        def _norm(df):
             df = df.copy()
             df.index = df.index.normalize()                     # วันที่ (เที่ยงคืน NY)
-            conv[s] = df
+            return df
+        conv = alpaca_bars(list(to_alp.values()), "1Day", now - pd.DateOffset(years=DAILY_YEARS), key, secret,
+                           finish=_norm, progress=progress)
     else:
         raise ValueError(interval)
     return {back.get(s, s): df for s, df in conv.items() if not df.empty}
