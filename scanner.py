@@ -19,7 +19,7 @@ from logic import resample_4h
 
 TFS = ["4H", "1H"]
 NAN = float("nan")
-FORMAT = "fibo-heads-v3"     # v2: dn_clear_at (Watchlist) · v3: dn_os_4H / dn_os_1H (ผ่าน Oversold)
+FORMAT = "fibo-heads-v4"     # v2: dn_clear_at · v3: dn_os_4H / dn_os_1H · v4: dn_clear_px (Watchlist)
 
 
 def frames_for(t: str, store: dict) -> dict:
@@ -74,7 +74,7 @@ def is_current_format(raw: pd.DataFrame) -> bool:
 
 
 def has_watchlist(raw: pd.DataFrame) -> bool:
-    return all(c in raw.columns for c in ("dn_clear_at", "dn_os_4H", "dn_os_1H"))
+    return all(c in raw.columns for c in ("dn_clear_at", "dn_os_4H", "dn_os_1H", "dn_clear_px"))
 
 
 # ---------- บันทึก / โหลดผล (สำหรับสแกนอัตโนมัติ) ----------

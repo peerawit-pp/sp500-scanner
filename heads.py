@@ -413,7 +413,7 @@ def heads_with_clear(df1h: pd.DataFrame | None, df4h: pd.DataFrame | None, hp: H
     """
     out = {"4H_up": NA, "4H_dn": NA, "1H_up": NA, "1H_dn": NA,
            "dn_clear_at": None, "dn_prev_4H": NA, "dn_prev_1H": NA,
-           "dn_os_4H": None, "dn_os_1H": None}
+           "dn_os_4H": None, "dn_os_1H": None, "dn_clear_px": NA}
     ok = lambda d: d is not None and len(d) >= hp.k_len + hp.smooth + 2   # noqa: E731
     up1 = dn1 = up4 = dn4 = None
     if ok(df1h):
@@ -437,6 +437,7 @@ def heads_with_clear(df1h: pd.DataFrame | None, df4h: pd.DataFrame | None, hp: H
     k = int(np.flatnonzero(has)[-1])                            # แท่งสุดท้ายที่ยังมีหัวขาลง
     out["dn_clear_at"] = pd.Timestamp(int(t1[k + 1]), tz="UTC").tz_convert("America/New_York")
     out["dn_prev_4H"], out["dn_prev_1H"] = float(dn4_at[k]), float(dn1[k])
+    out["dn_clear_px"] = float(df1h["Close"].iloc[k + 1])    # ราคาปิดแท่งที่เปลี่ยนกลุ่ม (ฐานคิด % performance)
     # หัวขาลงที่หายไป "ผ่าน Oversold" หรือยัง: %K ของ TF นั้น < OS อย่างน้อย 1 แท่ง
     # ตลอดช่วงที่หัวนั้นแสดงต่อเนื่อง (ตั้งแต่แท่งที่หัวเกิด จนถึงแท่งสุดท้ายก่อนหัวหาย)
     if not np.isnan(dn1[k]):

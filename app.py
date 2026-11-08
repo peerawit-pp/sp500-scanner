@@ -281,6 +281,7 @@ def present(raw: pd.DataFrame, show_val: bool) -> pd.DataFrame:
         row["_clear_at"] = rec.get("dn_clear_at")
         row["_prev4"], row["_prev1"] = rec.get("dn_prev_4H"), rec.get("dn_prev_1H")
         row["_os4"], row["_os1"] = rec.get("dn_os_4H"), rec.get("dn_os_1H")
+        row["_clear_px"] = rec.get("dn_clear_px")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -476,13 +477,12 @@ def os_ok(os4, os1) -> bool:
     return all(flags) if rule == "all" else any(flags)
 
 
-WL_MAX = 100
 WITHIN = {"ทั้งหมด": None, "24 ชม.": 24, "3 วัน": 72, "7 วัน": 168, "30 วัน": 720}
 
 # =====================================================================
 with tab_watch:
     st.markdown("หุ้นที่ **เพิ่งเปลี่ยนกลุ่ม** จาก 🔴 มีหัว Fibo ขาลง (4H หรือ 1H) → 🟢 ไม่มีหัว Fibo ขาลง "
-                f"เรียงจากล่าสุด (สูงสุด {WL_MAX} ตัว) · ใช้ผลสแกนและเงื่อนไข (ดัชนี / market cap / EMA / หัวขาขึ้น) "
+                "เรียงจากล่าสุด (แสดงทั้งหมด) · ใช้ผลสแกนและเงื่อนไข (ดัชนี / market cap / EMA / หัวขาขึ้น) "
                 "เดียวกับหน้า 🔍 สแกนหุ้น")
     if raw_view is None:
         st.info("ยังไม่มีผลสแกน — เปิดผลสแกนอัตโนมัติ หรือกดสแกนสดที่หน้า 🔍 สแกนหุ้น ก่อน")
@@ -508,15 +508,22 @@ with tab_watch:
             wl["_t"] = pd.to_datetime(wl["_clear_at"], utc=True)
             if WITHIN[within]:
                 wl = wl[wl["_t"] >= now_utc - pd.Timedelta(hours=WITHIN[within])]
-            wl = wl.sort_values("_t", ascending=False).head(WL_MAX)
-        m = st.columns(3)
+            wl = wl.sort_values("_t", ascending=False)
+            wl["_perf"] = [(p_ / c_ - 1) * 100 if not (_nn(c_) or _nn(p_)) and c_ else NAN
+                           for p_, c_ in zip(wl["Price"], wl["_clear_px"])]
+        m = st.columns(5)
         m[0].metric("ใน Watchlist", f"{len(wl):,}")
         if not wl.empty:
             m[1].metric("เปลี่ยนล่าสุด", wl["_t"].iloc[0].tz_convert("Asia/Bangkok").strftime("%d/%m %H:%M"))
             m[2].metric("ภายใน 24 ชม.", int((wl["_t"] >= now_utc - pd.Timedelta(hours=24)).sum()))
+            perf = pd.Series(wl["_perf"], dtype=float).dropna()
+            if not perf.empty:
+                m[3].metric("% Performance เฉลี่ย", f"{perf.mean():+.2f}%")
+                m[4].metric("บวก / ทั้งหมด", f"{int((perf > 0).sum())} / {len(perf)}")
         st.caption(f"ข้อมูลจาก {meta_view['src']} เมื่อ {meta_view['when']:%d %b %Y %H:%M} (เวลาไทย) · "
                    "เวลาเปลี่ยนกลุ่ม = เวลาปิดแท่ง (4H หรือ 1H) แรกที่ไม่มีหัว Fibo ขาลงเหลือทั้งสอง TF · "
-                   "ผ่าน Oversold = %K ของ TF นั้นลงต่ำกว่า OS อย่างน้อย 1 แท่ง ระหว่างที่หัวขาลงยังแสดงอยู่")
+                   "ผ่าน Oversold = %K ของ TF นั้นลงต่ำกว่า OS อย่างน้อย 1 แท่ง ระหว่างที่หัวขาลงยังแสดงอยู่ · "
+                   "% Performance = ราคาล่าสุดเทียบกับราคาปิดแท่ง 1H ที่เปลี่ยนกลุ่ม")
         if wl.empty:
             st.warning("ยังไม่มีหุ้นที่เปลี่ยนกลุ่มตามเงื่อนไขนี้")
         else:
@@ -530,12 +537,17 @@ with tab_watch:
             disp["หัว Fibo ขาลงที่หายไป"] = [
                 " · ".join(f"{tf} {v:,.2f}" for tf, v in (("4H", a), ("1H", b)) if not _nn(v)) or "-"
                 for a, b in zip(wl["_prev4"], wl["_prev1"])]
+            disp["ราคาตอนเปลี่ยนกลุ่ม"] = [r2(v) for v in wl["_clear_px"]]
+            disp["% Performance หลังเปลี่ยนกลุ่ม"] = [None if _nn(v) else round(float(v), 2) + 0.0 for v in wl["_perf"]]
             disp["ผ่าน Oversold"] = [
                 " · ".join(f"{tf} {'✅' if v else '❌'}" for tf, v in (("4H", a), ("1H", b)) if v is not None and not _nn(v))
                 or "-" for a, b in zip(wl["_os4"], wl["_os1"])]
             disp["Chart"] = wl["Chart"].values
             st.dataframe(disp, hide_index=True, width="stretch", key="t_watch",
                          column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="TradingView"),
+                                        "% Performance หลังเปลี่ยนกลุ่ม": st.column_config.NumberColumn(
+                                            "% Performance หลังเปลี่ยนกลุ่ม", format="%+.2f%%",
+                                            help="(ราคาล่าสุด ÷ ราคาปิดแท่งที่เปลี่ยนกลุ่ม − 1) × 100"),
                                         "Name": st.column_config.TextColumn("Name", width="medium"),
                                         "Index": st.column_config.TextColumn("Index", width="small")})
             st.download_button("⬇️ ดาวน์โหลด Watchlist (CSV)", disp.to_csv(index=False).encode("utf-8-sig"),
