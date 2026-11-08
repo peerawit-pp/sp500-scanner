@@ -19,7 +19,7 @@ from logic import resample_4h
 
 TFS = ["4H", "1H"]
 NAN = float("nan")
-FORMAT = "fibo-heads-v2"     # v2: เพิ่ม dn_clear_at (Watchlist)
+FORMAT = "fibo-heads-v3"     # v2: dn_clear_at (Watchlist) · v3: dn_os_4H / dn_os_1H (ผ่าน Oversold)
 
 
 def frames_for(t: str, store: dict) -> dict:
@@ -74,13 +74,15 @@ def is_current_format(raw: pd.DataFrame) -> bool:
 
 
 def has_watchlist(raw: pd.DataFrame) -> bool:
-    return "dn_clear_at" in raw.columns
+    return all(c in raw.columns for c in ("dn_clear_at", "dn_os_4H", "dn_os_1H"))
 
 
 # ---------- บันทึก / โหลดผล (สำหรับสแกนอัตโนมัติ) ----------
 def save_raw(raw: pd.DataFrame, path_csv, meta: dict, path_meta) -> None:
     out = raw.copy()
     for c in out.columns:
+        if c.startswith("dn_os_"):
+            out[c] = ["" if v is None or (isinstance(v, float) and math.isnan(v)) else str(bool(v)) for v in out[c]]
         if c.endswith(("_last", "_at")):
             out[c] = [None if v is None or (isinstance(v, float) and math.isnan(v)) else pd.Timestamp(v).isoformat()
                       for v in out[c]]
@@ -94,6 +96,8 @@ def load_raw(path_csv, path_meta) -> tuple[pd.DataFrame, dict]:
     for c in raw.columns:
         if c.endswith(("_last", "_at")):
             raw[c] = [None if (isinstance(v, float) and math.isnan(v)) else pd.Timestamp(v) for v in raw[c]]
+        elif c.startswith("dn_os_"):
+            raw[c] = [None if (isinstance(v, float) and math.isnan(v)) or v == "" else str(v) == "True" for v in raw[c]]
     if "Major" in raw.columns:
         raw["Major"] = raw["Major"].astype(str).eq("True")
     with open(path_meta, encoding="utf-8") as f:

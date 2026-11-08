@@ -412,7 +412,8 @@ def heads_with_clear(df1h: pd.DataFrame | None, df4h: pd.DataFrame | None, hp: H
                หรือในช่วงข้อมูลไม่เคยมีหัวขาลงเลย
     """
     out = {"4H_up": NA, "4H_dn": NA, "1H_up": NA, "1H_dn": NA,
-           "dn_clear_at": None, "dn_prev_4H": NA, "dn_prev_1H": NA}
+           "dn_clear_at": None, "dn_prev_4H": NA, "dn_prev_1H": NA,
+           "dn_os_4H": None, "dn_os_1H": None}
     ok = lambda d: d is not None and len(d) >= hp.k_len + hp.smooth + 2   # noqa: E731
     up1 = dn1 = up4 = dn4 = None
     if ok(df1h):
@@ -436,4 +437,17 @@ def heads_with_clear(df1h: pd.DataFrame | None, df4h: pd.DataFrame | None, hp: H
     k = int(np.flatnonzero(has)[-1])                            # แท่งสุดท้ายที่ยังมีหัวขาลง
     out["dn_clear_at"] = pd.Timestamp(int(t1[k + 1]), tz="UTC").tz_convert("America/New_York")
     out["dn_prev_4H"], out["dn_prev_1H"] = float(dn4_at[k]), float(dn1[k])
+    # หัวขาลงที่หายไป "ผ่าน Oversold" หรือยัง: %K ของ TF นั้น < OS อย่างน้อย 1 แท่ง
+    # ตลอดช่วงที่หัวนั้นแสดงต่อเนื่อง (ตั้งแต่แท่งที่หัวเกิด จนถึงแท่งสุดท้ายก่อนหัวหาย)
+    if not np.isnan(dn1[k]):
+        out["dn_os_1H"] = _passed_os(dn1, stoch_k(df1h, hp.k_len, hp.smooth).to_numpy(float), k, hp.os_level)
+    if dn4 is not None and not np.isnan(dn4_at[k]):
+        out["dn_os_4H"] = _passed_os(dn4, stoch_k(df4h, hp.k_len, hp.smooth).to_numpy(float), int(j[k]), hp.os_level)
     return out
+
+
+def _passed_os(head: np.ndarray, k: np.ndarray, end: int, os_level: float) -> bool:
+    start = end
+    while start > 0 and not np.isnan(head[start - 1]):
+        start -= 1
+    return bool(np.any(k[start:end + 1] < os_level))

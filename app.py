@@ -280,6 +280,7 @@ def present(raw: pd.DataFrame, show_val: bool) -> pd.DataFrame:
         row["_has_dn"] = any(not _nn(v) for v in dns.values())
         row["_clear_at"] = rec.get("dn_clear_at")
         row["_prev4"], row["_prev1"] = rec.get("dn_prev_4H"), rec.get("dn_prev_1H")
+        row["_os4"], row["_os1"] = rec.get("dn_os_4H"), rec.get("dn_os_1H")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -461,6 +462,20 @@ def ago(t: pd.Timestamp, now: pd.Timestamp) -> str:
     return f"{d} วัน {h} ชม." if d else (f"{h} ชม." if h else f"{int(sec // 60)} นาที")
 
 
+OS_RULES = {"ทุก TF ที่มีหัวขาลง (แนะนำ)": "all", "อย่างน้อย 1 TF": "any", "ไม่กรอง": "none"}
+
+
+def os_ok(os4, os1) -> bool:
+    """หัวขาลงที่หายไปผ่าน Oversold ตามกติกาที่เลือก (None = TF นั้นไม่มีหัวก่อนหาย)"""
+    flags = [bool(v) for v in (os4, os1) if v is not None and not _nn(v)]
+    rule = OS_RULES[os_rule]
+    if rule == "none":
+        return True
+    if not flags:
+        return False
+    return all(flags) if rule == "all" else any(flags)
+
+
 WL_MAX = 100
 WITHIN = {"ทั้งหมด": None, "24 ชม.": 24, "3 วัน": 72, "7 วัน": 168, "30 วัน": 720}
 
@@ -475,14 +490,19 @@ with tab_watch:
         st.info("ผลสแกนนี้ยังไม่มีข้อมูลเวลาเปลี่ยนกลุ่ม (รูปแบบเก่า) — ไปที่ GitHub **Actions → Auto scan → "
                 "Run workflow** หรือกดสแกนสดใหม่")
     else:
-        w1, w2 = st.columns([1, 1])
+        w1, w2, w3 = st.columns([1, 1.4, 0.8])
         within = w1.selectbox("เปลี่ยนกลุ่มภายใน", list(WITHIN), index=0)
-        show_val_w = w2.toggle("แสดงราคาหัว Fibo", False, key="wl_val")
+        os_rule = w2.selectbox("หัว Fibo ขาลงที่หายไป ต้องผ่าน Oversold", list(OS_RULES), index=0,
+                               help="ตัดกรณีหัวขาลงเกิดจาก Lower High + ราคาต่ำกว่า X แล้วราคาเด้งกลับทะลุหัวทันที "
+                                    "โดยที่ %K ยังไม่เคยลงถึง Oversold (เช่น HUM) · เก็บเฉพาะกรณีที่ลงไป Oversold "
+                                    "ก่อนแล้วค่อยกลับขึ้นมาทะลุหัว (เช่น VMRK)")
+        show_val_w = w3.toggle("แสดงราคาหัว Fibo", False, key="wl_val")
         res_w = present(raw_view, show_val_w)
         if res_w.empty:
             wl = res_w
         else:
             wl = res_w[~res_w["_has_dn"] & res_w["_clear_at"].notna()].copy()
+            wl = wl[[os_ok(a, b) for a, b in zip(wl["_os4"], wl["_os1"])]] if not wl.empty else wl
         now_utc = pd.Timestamp.now(tz="UTC")
         if not wl.empty:
             wl["_t"] = pd.to_datetime(wl["_clear_at"], utc=True)
@@ -495,7 +515,8 @@ with tab_watch:
             m[1].metric("เปลี่ยนล่าสุด", wl["_t"].iloc[0].tz_convert("Asia/Bangkok").strftime("%d/%m %H:%M"))
             m[2].metric("ภายใน 24 ชม.", int((wl["_t"] >= now_utc - pd.Timedelta(hours=24)).sum()))
         st.caption(f"ข้อมูลจาก {meta_view['src']} เมื่อ {meta_view['when']:%d %b %Y %H:%M} (เวลาไทย) · "
-                   "เวลาเปลี่ยนกลุ่ม = เวลาปิดแท่ง (4H หรือ 1H) แรกที่ไม่มีหัว Fibo ขาลงเหลือทั้งสอง TF")
+                   "เวลาเปลี่ยนกลุ่ม = เวลาปิดแท่ง (4H หรือ 1H) แรกที่ไม่มีหัว Fibo ขาลงเหลือทั้งสอง TF · "
+                   "ผ่าน Oversold = %K ของ TF นั้นลงต่ำกว่า OS อย่างน้อย 1 แท่ง ระหว่างที่หัวขาลงยังแสดงอยู่")
         if wl.empty:
             st.warning("ยังไม่มีหุ้นที่เปลี่ยนกลุ่มตามเงื่อนไขนี้")
         else:
@@ -509,6 +530,9 @@ with tab_watch:
             disp["หัว Fibo ขาลงที่หายไป"] = [
                 " · ".join(f"{tf} {v:,.2f}" for tf, v in (("4H", a), ("1H", b)) if not _nn(v)) or "-"
                 for a, b in zip(wl["_prev4"], wl["_prev1"])]
+            disp["ผ่าน Oversold"] = [
+                " · ".join(f"{tf} {'✅' if v else '❌'}" for tf, v in (("4H", a), ("1H", b)) if v is not None and not _nn(v))
+                or "-" for a, b in zip(wl["_os4"], wl["_os1"])]
             disp["Chart"] = wl["Chart"].values
             st.dataframe(disp, hide_index=True, width="stretch", key="t_watch",
                          column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="TradingView"),
