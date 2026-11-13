@@ -1,13 +1,13 @@
 {
-  "scanned_at": "2026-11-12T21:10:01.774273+00:00",
-  "last_4h_bar": "2026-11-12 13:30",
-  "n_symbols": 624,
+  "scanned_at": "2026-11-13T18:30:51.043431+00:00",
+  "last_4h_bar": "2026-11-13 09:30",
+  "n_symbols": 625,
   "min_cap_b": 10.0,
   "universe": "S&P 500 + NASDAQ 100 + Dow 30 + NASDAQ Composite, ≥ 10B",
   "params": "Pine default (Stoch 9/3, OS 20, OB 80, Max Scan 80, Trail 5, Lookback 3 ทั้งขาขึ้น/ขาลง), หัว Fibo 4H/1H, EMA89 4H, แท่งที่ปิดแล้ว",
   "missing": {
     "1h": 0
   },
-  "duration_sec": 88,
+  "duration_sec": 66,
   "format": "fibo-heads-v4"
 }
