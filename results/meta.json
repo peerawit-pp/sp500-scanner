@@ -1,6 +1,6 @@
 {
-  "scanned_at": "2026-11-19T18:37:56.373299+00:00",
-  "last_4h_bar": "2026-11-19 09:30",
+  "scanned_at": "2026-11-19T21:12:05.620090+00:00",
+  "last_4h_bar": "2026-11-19 13:30",
   "n_symbols": 613,
   "min_cap_b": 10.0,
   "universe": "S&P 500 + NASDAQ 100 + Dow 30 + NASDAQ Composite, ≥ 10B",
@@ -8,6 +8,6 @@
   "missing": {
     "1h": 0
   },
-  "duration_sec": 55,
+  "duration_sec": 116,
   "format": "fibo-heads-v4"
 }
